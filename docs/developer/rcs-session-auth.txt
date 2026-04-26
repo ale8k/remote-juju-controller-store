@@ -1,0 +1,67 @@
+RCS Session Auth
+================
+
+What rcs login does
+-------------------
+1. rcs login <rcsd-addr> creates an API client to rcsd.
+2. It calls GET /auth/provider to get:
+   - issuer
+   - client_id
+3. It does OIDC discovery on:
+   <issuer>/.well-known/openid-configuration
+   and reads:
+   - device_authorization_endpoint
+   - token_endpoint
+4. It starts OAuth device flow with the configured client_id and scopes:
+   openid email profile
+5. User completes browser auth using the URL/code shown by the CLI.
+6. CLI receives a Keycloak access token from the device flow.
+7. CLI sends that token to POST /auth/device.
+8. rcsd verifies the token, upserts the user, and mints an RCS session JWT.
+9. CLI saves session data to:
+   ~/.local/share/rcs/session.json
+
+Session file
+------------
+Path:
+- ~/.local/share/rcs/session.json
+
+Shape:
+- addr: rcs server address used for API calls
+- token: RCS session JWT
+
+Example:
+{
+  "addr": "http://localhost:8484",
+  "token": "<rcs-session-jwt>"
+}
+
+File permissions and lifecycle
+------------------------------
+- Parent directory is created as 0700.
+- Session file is written as 0600.
+- rcs logout removes the session file.
+
+Where the session token is minted and validated
+------------------------------------------------
+Minting:
+- Endpoint: POST /auth/device
+- Handler: internal/store/auth.go
+- Token type: RS256 JWT signed by the active session signing key.
+- Claims include: sub, email, iat, exp, iss=rcsd
+- kid header is set to support key lookup/rotation.
+
+Validation:
+- Middleware: AuthMiddleware in internal/store/middleware.go
+- Applies to all authenticated routes.
+- Requires Authorization: Bearer <session-jwt>
+- Resolves signing key by kid (with fallback to recent keys), verifies exp,
+  and stores sub in request context as userID.
+
+Where rcsd auth stack is started
+--------------------------------
+- Server entrypoint: cmd/srv/main.go
+- Builds OIDC provider and loads signing keys.
+- Registers routes in internal/store/server.go:
+  - Public: /auth/provider, /auth/device, /.well-known/jwks.json
+  - Protected: all /controllers and /credentials endpoints via AuthMiddleware

@@ -1,0 +1,17 @@
+root = "."
+tmp_dir = "tmp/air"
+
+[build]
+  cmd         = "go build -buildvcs=false -o tmp/air/rcsd ./cmd/srv"
+  bin         = "tmp/air/rcsd"
+  full_bin    = "tmp/air/rcsd --addr :8484 --db tmp/store.db --oidc-issuer http://rcs-keycloak:3082/realms/rcs --oidc-external-issuer http://localhost:3082/realms/rcs --oidc-skip-issuer-check --oidc-skip-client-id-check"
+  include_ext = ["go"]
+  exclude_dir = ["build", "tmp", "pkg/client", "local", "docs", "api"]
+  delay       = 500
+  kill_delay  = "2s"
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true

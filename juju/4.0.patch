@@ -1,0 +1,1611 @@
+diff --git a/api/jujuclient/remotestore.go b/api/jujuclient/remotestore.go
+new file mode 100644
+index 0000000000..bb8d9666d4
+--- /dev/null
++++ b/api/jujuclient/remotestore.go
+@@ -0,0 +1,908 @@
++package jujuclient
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	"github.com/juju/errors"
++
++	"github.com/juju/juju/cloud"
++
++	"github.com/ale8k/remote-juju-controller-store/pkg/client"
++)
++
++var _ ClientStore = (*RemoteStore)(nil)
++
++// RemoteStore implements ClientStore by communicating with a
++// remote-controller-store HTTP server. Use NewRemoteStore to create one.
++type RemoteStore struct {
++	api     client.ClientWithResponsesInterface
++	baseURL string
++	initErr error
++}
++
++// NewRemoteStore returns a RemoteStore that proxies all ClientStore calls to
++// the server at addr (host:port, no scheme).
++func NewRemoteStore(addr string) *RemoteStore {
++	baseURL := addr
++	if !strings.Contains(baseURL, "://") {
++		baseURL = "http://" + baseURL
++	}
++
++	api, err := client.NewClientWithResponses(
++		baseURL,
++		client.WithRequestEditorFn(addAuthHeader),
++	)
++	if err != nil {
++		return &RemoteStore{initErr: errors.Trace(err)}
++	}
++
++	return &RemoteStore{api: api, baseURL: baseURL}
++}
++
++func (s *RemoteStore) ready() error {
++	if s.initErr != nil {
++		return errors.Trace(s.initErr)
++	}
++	if s.api == nil {
++		return errors.New("remote store client is not initialized")
++	}
++	return nil
++}
++
++func addAuthHeader(_ context.Context, req *http.Request) error {
++	tok, err := loadSessionToken()
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Authorization", "Bearer "+tok)
++	return nil
++}
++
++type rcsSession struct {
++	Token string `json:"token"`
++	Addr  string `json:"addr"`
++}
++
++func loadSessionToken() (string, error) {
++	if tok := strings.TrimSpace(os.Getenv("RCS_SESSION_TOKEN")); tok != "" {
++		return tok, nil
++	}
++
++	sessionPath := strings.TrimSpace(os.Getenv("RCS_SESSION_PATH"))
++	if sessionPath == "" {
++		home, err := os.UserHomeDir()
++		if err != nil {
++			return "", errors.Trace(err)
++		}
++		sessionPath = filepath.Join(home, ".local", "share", "rcs", "session.json")
++	}
++
++	b, err := os.ReadFile(sessionPath)
++	if err != nil {
++		return "", errors.Annotatef(err, "read RCS session file %q", sessionPath)
++	}
++
++	var s rcsSession
++	if err := json.Unmarshal(b, &s); err != nil {
++		return "", errors.Annotatef(err, "parse RCS session file %q", sessionPath)
++	}
++	if strings.TrimSpace(s.Token) == "" {
++		return "", fmt.Errorf("RCS session file %q does not contain a token", sessionPath)
++	}
++	return s.Token, nil
++}
++
++func checkStatus(statusCode int, status string, body []byte) error {
++	if statusCode >= 200 && statusCode < 300 {
++		return nil
++	}
++	msg := strings.TrimSpace(string(body))
++	switch statusCode {
++	case http.StatusNotFound:
++		return errors.NotFoundf("%s", msg)
++	case http.StatusConflict:
++		return errors.AlreadyExistsf("%s", msg)
++	}
++	return fmt.Errorf("remote store: %s: %s", status, msg)
++}
++
++func marshalBody(v any) (*bytes.Reader, error) {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	return bytes.NewReader(b), nil
++}
++
++// -- ControllerUpdater --------------------------------------------------------
++
++// AddController implements ControllerUpdater.
++func (s *RemoteStore) AddController(controllerName string, details ControllerDetails) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	if err := ValidateControllerDetails(details); err != nil {
++		return err
++	}
++	body, err := marshalBody(details)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.AddControllerWithBodyWithResponse(context.Background(), controllerName, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// UpdateController implements ControllerUpdater.
++func (s *RemoteStore) UpdateController(controllerName string, details ControllerDetails) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	if err := ValidateControllerDetails(details); err != nil {
++		return err
++	}
++	body, err := marshalBody(details)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.UpdateControllerWithBodyWithResponse(context.Background(), controllerName, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// SetCurrentController implements ControllerUpdater.
++func (s *RemoteStore) SetCurrentController(controllerName string) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	resp, err := s.api.SetCurrentControllerWithResponse(context.Background(), client.NameRequest{Name: controllerName})
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- ControllerRemover --------------------------------------------------------
++
++// RemoveController implements ControllerRemover.
++func (s *RemoteStore) RemoveController(controllerName string) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	resp, err := s.api.RemoveControllerWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- ControllerGetter ---------------------------------------------------------
++
++// AllControllers implements ControllerGetter.
++func (s *RemoteStore) AllControllers() (map[string]ControllerDetails, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.AllControllersWithResponse(context.Background())
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(resp.Body, &raw); err != nil {
++		return nil, errors.Trace(err)
++	}
++
++	result := make(map[string]ControllerDetails, len(raw))
++	for name, r := range raw {
++		var d ControllerDetails
++		if err := json.Unmarshal(r, &d); err != nil {
++			return nil, errors.Annotatef(err, "decoding controller %q", name)
++		}
++		result[name] = d
++	}
++	return result, nil
++}
++
++// ControllerByName implements ControllerGetter.
++func (s *RemoteStore) ControllerByName(controllerName string) (*ControllerDetails, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.ControllerByNameWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var d ControllerDetails
++	if err := json.Unmarshal(resp.Body, &d); err != nil {
++		return nil, errors.Trace(err)
++	}
++	return &d, nil
++}
++
++// ControllerByAPIEndpoints implements ControllerGetter.
++func (s *RemoteStore) ControllerByAPIEndpoints(endpoints ...string) (*ControllerDetails, string, error) {
++	if err := s.ready(); err != nil {
++		return nil, "", err
++	}
++	resp, err := s.api.ControllerByAPIEndpointsWithResponse(context.Background(), endpoints)
++	if err != nil {
++		return nil, "", errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, "", err
++	}
++
++	var result struct {
++		Name    string          `json:"name"`
++		Details json.RawMessage `json:"details"`
++	}
++	if err := json.Unmarshal(resp.Body, &result); err != nil {
++		return nil, "", errors.Trace(err)
++	}
++
++	var d ControllerDetails
++	if err := json.Unmarshal(result.Details, &d); err != nil {
++		return nil, "", errors.Trace(err)
++	}
++	return &d, result.Name, nil
++}
++
++// CurrentController implements ControllerGetter.
++func (s *RemoteStore) CurrentController() (string, error) {
++	if err := s.ready(); err != nil {
++		return "", err
++	}
++	resp, err := s.api.CurrentControllerWithResponse(context.Background())
++	if err != nil {
++		return "", errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return "", err
++	}
++	if resp.JSON200 != nil && resp.JSON200.Name != nil {
++		return *resp.JSON200.Name, nil
++	}
++
++	var parsed struct {
++		Name string `json:"name"`
++	}
++	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
++		return "", errors.Trace(err)
++	}
++	return parsed.Name, nil
++}
++
++// PreviousController implements ControllerGetter.
++func (s *RemoteStore) PreviousController() (string, bool, error) {
++	if err := s.ready(); err != nil {
++		return "", false, err
++	}
++	resp, err := s.api.PreviousControllerWithResponse(context.Background())
++	if err != nil {
++		return "", false, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return "", false, err
++	}
++	if resp.JSON200 != nil && resp.JSON200.Name != nil && resp.JSON200.Switched != nil {
++		return *resp.JSON200.Name, *resp.JSON200.Switched, nil
++	}
++
++	var parsed struct {
++		Name     string `json:"name"`
++		Switched bool   `json:"switched"`
++	}
++	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
++		return "", false, errors.Trace(err)
++	}
++	return parsed.Name, parsed.Switched, nil
++}
++
++// -- ModelUpdater -------------------------------------------------------------
++
++// modelURL returns the URL for individual model operations using the
++// /by-name?model= pattern, which avoids Gin path-routing conflicts caused by
++// slash characters in qualified model names (e.g. "admin/default").
++func (s *RemoteStore) modelURL(controllerName, modelName string) (string, error) {
++	base, err := url.Parse(s.baseURL)
++	if err != nil {
++		return "", errors.Trace(err)
++	}
++	base.Path = fmt.Sprintf("/controllers/%s/models/by-name", controllerName)
++	q := base.Query()
++	q.Set("model", modelName)
++	base.RawQuery = q.Encode()
++	return base.String(), nil
++}
++
++// doModelRequest performs a direct HTTP request for an individual model
++// operation so that qualified model names (containing "/") are sent as a
++// query parameter rather than a path segment.
++func (s *RemoteStore) doModelRequest(method, rawURL string, body *bytes.Reader) (int, []byte, error) {
++	var bodyReader io.Reader
++	if body != nil {
++		bodyReader = body
++	}
++	req, err := http.NewRequestWithContext(context.Background(), method, rawURL, bodyReader)
++	if err != nil {
++		return 0, nil, errors.Trace(err)
++	}
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if err := addAuthHeader(context.Background(), req); err != nil {
++		return 0, nil, errors.Trace(err)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		return 0, nil, errors.Trace(err)
++	}
++	defer resp.Body.Close() //nolint:errcheck
++	var buf bytes.Buffer
++	_, _ = buf.ReadFrom(resp.Body)
++	return resp.StatusCode, buf.Bytes(), nil
++}
++
++// UpdateModel implements ModelUpdater.
++func (s *RemoteStore) UpdateModel(controllerName, modelName string, details ModelDetails) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	if err := ValidateModel(modelName, details); err != nil {
++		return err
++	}
++	body, err := marshalBody(details)
++	if err != nil {
++		return err
++	}
++	rawURL, err := s.modelURL(controllerName, modelName)
++	if err != nil {
++		return err
++	}
++	code, respBody, err := s.doModelRequest(http.MethodPut, rawURL, body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(code, http.StatusText(code), respBody)
++}
++
++// SetModels implements ModelUpdater.
++func (s *RemoteStore) SetModels(controllerName string, models map[string]ModelDetails) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	body, err := marshalBody(models)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.SetModelsWithBodyWithResponse(context.Background(), controllerName, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// SetCurrentModel implements ModelUpdater.
++func (s *RemoteStore) SetCurrentModel(controllerName, modelName string) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return errors.Trace(err)
++	}
++	resp, err := s.api.SetCurrentModelWithResponse(context.Background(), controllerName, client.NameRequest{Name: modelName})
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- ModelRemover -------------------------------------------------------------
++
++// RemoveModel implements ModelRemover.
++func (s *RemoteStore) RemoveModel(controllerName, modelName string) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	if err := ValidateModelName(modelName); err != nil {
++		return err
++	}
++	rawURL, err := s.modelURL(controllerName, modelName)
++	if err != nil {
++		return err
++	}
++	code, respBody, err := s.doModelRequest(http.MethodDelete, rawURL, nil)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(code, http.StatusText(code), respBody)
++}
++
++// -- ModelGetter --------------------------------------------------------------
++
++// AllModels implements ModelGetter.
++func (s *RemoteStore) AllModels(controllerName string) (map[string]ModelDetails, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.AllModelsWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(resp.Body, &raw); err != nil {
++		return nil, errors.Trace(err)
++	}
++
++	result := make(map[string]ModelDetails, len(raw))
++	for name, r := range raw {
++		var d ModelDetails
++		if err := json.Unmarshal(r, &d); err != nil {
++			return nil, errors.Annotatef(err, "decoding model %q", name)
++		}
++		result[name] = d
++	}
++	return result, nil
++}
++
++// CurrentModel implements ModelGetter.
++func (s *RemoteStore) CurrentModel(controllerName string) (string, error) {
++	if err := s.ready(); err != nil {
++		return "", err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return "", err
++	}
++	resp, err := s.api.CurrentModelWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return "", errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return "", err
++	}
++	if resp.JSON200 != nil && resp.JSON200.Name != nil {
++		return *resp.JSON200.Name, nil
++	}
++
++	var parsed struct {
++		Name string `json:"name"`
++	}
++	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
++		return "", errors.Trace(err)
++	}
++	return parsed.Name, nil
++}
++
++// PreviousModel implements ModelGetter.
++func (s *RemoteStore) PreviousModel(controllerName string) (string, error) {
++	if err := s.ready(); err != nil {
++		return "", err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return "", errors.Trace(err)
++	}
++	resp, err := s.api.PreviousModelWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return "", errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return "", err
++	}
++	if resp.JSON200 != nil && resp.JSON200.Name != nil {
++		return *resp.JSON200.Name, nil
++	}
++
++	var parsed struct {
++		Name string `json:"name"`
++	}
++	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
++		return "", errors.Trace(err)
++	}
++	return parsed.Name, nil
++}
++
++// ModelByName implements ModelGetter.
++func (s *RemoteStore) ModelByName(controllerName, modelName string) (*ModelDetails, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	rawURL, err := s.modelURL(controllerName, modelName)
++	if err != nil {
++		return nil, err
++	}
++	code, respBody, err := s.doModelRequest(http.MethodGet, rawURL, nil)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(code, http.StatusText(code), respBody); err != nil {
++		return nil, err
++	}
++	var details ModelDetails
++	if err := json.Unmarshal(respBody, &details); err != nil {
++		return nil, errors.Trace(err)
++	}
++	return &details, nil
++}
++
++// -- AccountUpdater -----------------------------------------------------------
++
++// UpdateAccount implements AccountUpdater.
++func (s *RemoteStore) UpdateAccount(controllerName string, details AccountDetails) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	if err := ValidateAccountDetails(details); err != nil {
++		return err
++	}
++	body, err := marshalBody(details)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.UpdateAccountWithBodyWithResponse(context.Background(), controllerName, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- AccountRemover -----------------------------------------------------------
++
++// RemoveAccount implements AccountRemover.
++func (s *RemoteStore) RemoveAccount(controllerName string) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return err
++	}
++	resp, err := s.api.RemoveAccountWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- AccountGetter ------------------------------------------------------------
++
++// AccountDetails implements AccountGetter.
++func (s *RemoteStore) AccountDetails(controllerName string) (*AccountDetails, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	if err := ValidateControllerName(controllerName); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.AccountDetailsWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var d AccountDetails
++	if err := json.Unmarshal(resp.Body, &d); err != nil {
++		return nil, errors.Trace(err)
++	}
++	return &d, nil
++}
++
++// -- CredentialGetter ---------------------------------------------------------
++
++// CredentialForCloud implements CredentialGetter.
++func (s *RemoteStore) CredentialForCloud(cloudName string) (*cloud.CloudCredential, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.CredentialForCloudWithResponse(context.Background(), cloudName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var d cloud.CloudCredential
++	if err := json.Unmarshal(resp.Body, &d); err != nil {
++		return nil, errors.Trace(err)
++	}
++	return &d, nil
++}
++
++// AllCredentials implements CredentialGetter.
++func (s *RemoteStore) AllCredentials() (map[string]cloud.CloudCredential, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.AllCredentialsWithResponse(context.Background())
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(resp.Body, &raw); err != nil {
++		return nil, errors.Trace(err)
++	}
++
++	result := make(map[string]cloud.CloudCredential, len(raw))
++	for name, r := range raw {
++		var d cloud.CloudCredential
++		if err := json.Unmarshal(r, &d); err != nil {
++			return nil, errors.Annotatef(err, "decoding credential %q", name)
++		}
++		result[name] = d
++	}
++	return result, nil
++}
++
++// -- CredentialUpdater --------------------------------------------------------
++
++// UpdateCredential implements CredentialUpdater.
++func (s *RemoteStore) UpdateCredential(cloudName string, details cloud.CloudCredential) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	body, err := marshalBody(details)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.UpdateCredentialWithBodyWithResponse(context.Background(), cloudName, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- BootstrapConfigUpdater ---------------------------------------------------
++
++// UpdateBootstrapConfig implements BootstrapConfigUpdater.
++func (s *RemoteStore) UpdateBootstrapConfig(controller string, cfg BootstrapConfig) error {
++	if err := s.ready(); err != nil {
++		return err
++	}
++	if err := ValidateControllerName(controller); err != nil {
++		return err
++	}
++	body, err := marshalBody(cfg)
++	if err != nil {
++		return err
++	}
++	resp, err := s.api.UpdateBootstrapConfigWithBodyWithResponse(context.Background(), controller, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// -- BootstrapConfigGetter ----------------------------------------------------
++
++// BootstrapConfigForController implements BootstrapConfigGetter.
++func (s *RemoteStore) BootstrapConfigForController(controllerName string) (*BootstrapConfig, error) {
++	if err := s.ready(); err != nil {
++		return nil, err
++	}
++	resp, err := s.api.BootstrapConfigWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		return nil, err
++	}
++
++	var cfg BootstrapConfig
++	if err := json.Unmarshal(resp.Body, &cfg); err != nil {
++		return nil, errors.Trace(err)
++	}
++	return &cfg, nil
++}
++
++// -- CookieStore --------------------------------------------------------------
++
++// CookieJar implements CookieStore. It fetches any existing cookies for the
++// controller from the server and returns an in-memory jar that persists back
++// via Save().
++func (s *RemoteStore) CookieJar(controllerName string) (CookieJar, error) {
++	jar := &remoteCookieJar{
++		store:      s,
++		controller: controllerName,
++		entries:    make(map[string][]*http.Cookie),
++	}
++
++	if err := s.ready(); err != nil {
++		return jar, nil
++	}
++
++	resp, err := s.api.GetCookiesWithResponse(context.Background(), controllerName)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++	if err := checkStatus(resp.StatusCode(), resp.Status(), resp.Body); err != nil {
++		// Best effort: preserve previous behavior and return empty in-memory jar.
++		return jar, nil
++	}
++
++	var raw []cookieEntry
++	if err := json.Unmarshal(resp.Body, &raw); err != nil {
++		return nil, errors.Trace(err)
++	}
++	for _, e := range raw {
++		jar.entries[e.URL] = append(jar.entries[e.URL], e.toCookie())
++	}
++	return jar, nil
++}
++
++// cookieEntry is the JSON representation of a single cookie stored on the server.
++type cookieEntry struct {
++	URL      string `json:"url"`
++	Name     string `json:"name"`
++	Value    string `json:"value"`
++	Path     string `json:"path,omitempty"`
++	Domain   string `json:"domain,omitempty"`
++	Secure   bool   `json:"secure,omitempty"`
++	HttpOnly bool   `json:"httpOnly,omitempty"`
++}
++
++func (e cookieEntry) toCookie() *http.Cookie {
++	return &http.Cookie{
++		Name:     e.Name,
++		Value:    e.Value,
++		Path:     e.Path,
++		Domain:   e.Domain,
++		Secure:   e.Secure,
++		HttpOnly: e.HttpOnly,
++	}
++}
++
++func cookieEntryFrom(rawURL string, c *http.Cookie) cookieEntry {
++	return cookieEntry{
++		URL:      rawURL,
++		Name:     c.Name,
++		Value:    c.Value,
++		Path:     c.Path,
++		Domain:   c.Domain,
++		Secure:   c.Secure,
++		HttpOnly: c.HttpOnly,
++	}
++}
++
++// remoteCookieJar implements CookieJar backed by the remote server.
++type remoteCookieJar struct {
++	store      *RemoteStore
++	controller string
++	mu         sync.Mutex
++	// entries maps URL string -> cookies for that URL.
++	entries map[string][]*http.Cookie
++}
++
++// Cookies implements http.CookieJar.
++func (j *remoteCookieJar) Cookies(u *url.URL) []*http.Cookie {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	return j.entries[u.String()]
++}
++
++// SetCookies implements http.CookieJar.
++func (j *remoteCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	key := u.String()
++
++	// Merge: replace by name, add new.
++	existing := j.entries[key]
++	for _, incoming := range cookies {
++		found := false
++		for i, e := range existing {
++			if e.Name == incoming.Name {
++				existing[i] = incoming
++				found = true
++				break
++			}
++		}
++		if !found {
++			existing = append(existing, incoming)
++		}
++	}
++	j.entries[key] = existing
++}
++
++// RemoveAll implements CookieJar. Clears in-memory cookies and removes them
++// from the server.
++func (j *remoteCookieJar) RemoveAll() {
++	j.mu.Lock()
++	j.entries = make(map[string][]*http.Cookie)
++	j.mu.Unlock()
++
++	if err := j.store.ready(); err != nil {
++		return
++	}
++	resp, err := j.store.api.RemoveAllCookiesWithResponse(context.Background(), j.controller)
++	if err != nil {
++		return
++	}
++	_ = checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
++
++// Save implements CookieJar. Persists in-memory cookies to the server.
++func (j *remoteCookieJar) Save() error {
++	if err := j.store.ready(); err != nil {
++		return err
++	}
++
++	j.mu.Lock()
++	var flat []cookieEntry
++	for rawURL, cookies := range j.entries {
++		for _, c := range cookies {
++			flat = append(flat, cookieEntryFrom(rawURL, c))
++		}
++	}
++	j.mu.Unlock()
++
++	body, err := marshalBody(flat)
++	if err != nil {
++		return err
++	}
++	resp, err := j.store.api.SaveCookiesWithBodyWithResponse(context.Background(), j.controller, "application/json", body)
++	if err != nil {
++		return errors.Trace(err)
++	}
++	return checkStatus(resp.StatusCode(), resp.Status(), resp.Body)
++}
+diff --git a/api/rcsjwtloginprovider.go b/api/rcsjwtloginprovider.go
+new file mode 100644
+index 0000000000..8238d67173
+--- /dev/null
++++ b/api/rcsjwtloginprovider.go
+@@ -0,0 +1,135 @@
++// Copyright 2026 Canonical Ltd.
++// Licensed under the AGPLv3, see LICENCE file for details.
++
++package api
++
++import (
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"strings"
++
++	"github.com/juju/errors"
++
++	"github.com/ale8k/remote-juju-controller-store/pkg/client"
++	"github.com/juju/juju/api/base"
++	jujuversion "github.com/juju/juju/core/version"
++	"github.com/juju/juju/rpc/params"
++)
++
++// NewRCSJWTLoginProvider returns a LoginProvider that mints a short-lived
++// controller-login JWT from RCS and presents it directly to the controller.
++//
++// rcsServerURL is the base URL of the RCS server (e.g. "http://localhost:8484").
++// rcsSessionToken is the Bearer token from session.json.
++// controllerName is the RCS controller name used to mint the token.
++func NewRCSJWTLoginProvider(rcsServerURL, rcsSessionToken, controllerName string) LoginProvider {
++	return &rcsJWTLoginProvider{
++		rcsServerURL:    rcsServerURL,
++		rcsSessionToken: rcsSessionToken,
++		controllerName:  controllerName,
++	}
++}
++
++type rcsJWTLoginProvider struct {
++	rcsServerURL    string
++	rcsSessionToken string
++	controllerName  string
++}
++
++// Login implements LoginProvider.Login.
++// It mints a fresh JWT from RCS and submits it to the controller Admin.Login RPC.
++func (p *rcsJWTLoginProvider) Login(ctx context.Context, caller base.APICaller) (*LoginResultParams, error) {
++	jwt, err := p.mintJWT(ctx)
++	if err != nil {
++		return nil, errors.Annotate(err, "rcs jwt login provider: mint controller token")
++	}
++
++	authTag, err := jwtSubClaim(jwt)
++	if err != nil {
++		return nil, errors.Annotate(err, "rcs jwt login provider: extract sub from token")
++	}
++
++	var result params.LoginResult
++	err = caller.APICall(ctx, "Admin", 3, "", "Login", &params.LoginRequest{
++		AuthTag:       authTag,
++		Token:         jwt,
++		ClientVersion: jujuversion.Current.String(),
++	}, &result)
++	if err != nil {
++		return nil, errors.Trace(err)
++	}
++
++	return NewLoginResultParams(result)
++}
++
++// AuthHeader implements LoginProvider.AuthHeader.
++// Returns the JWT as a Bearer token for HTTP endpoints (e.g. debug-log).
++func (p *rcsJWTLoginProvider) AuthHeader() (http.Header, error) {
++	jwt, err := p.mintJWT(context.Background())
++	if err != nil {
++		return nil, errors.Annotate(err, "rcs jwt login provider: mint controller token for auth header")
++	}
++	h := make(http.Header)
++	h.Set("Authorization", "Bearer "+jwt)
++	return h, nil
++}
++
++// String implements LoginProvider.String.
++func (p *rcsJWTLoginProvider) String() string {
++	return fmt.Sprintf("RCSJWTLoginProvider(%s)", p.controllerName)
++}
++
++// mintJWT calls the RCS token endpoint and returns the base64-encoded JWT.
++func (p *rcsJWTLoginProvider) mintJWT(ctx context.Context) (string, error) {
++	rcsClient, err := client.NewClientWithResponses(
++		p.rcsServerURL,
++		client.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
++			req.Header.Set("Authorization", "Bearer "+p.rcsSessionToken)
++			return nil
++		}),
++	)
++	if err != nil {
++		return "", errors.Annotate(err, "create RCS client")
++	}
++
++	resp, err := rcsClient.MintControllerTokenWithResponse(ctx, p.controllerName)
++	if err != nil {
++		return "", errors.Annotate(err, "POST controller token")
++	}
++	if resp.StatusCode() != http.StatusOK || resp.JSON200 == nil {
++		return "", fmt.Errorf("RCS token endpoint returned %s", resp.Status())
++	}
++
++	return resp.JSON200.Token, nil
++}
++
++// jwtSubClaim decodes the JWT payload (without verifying the signature) and
++// returns the "sub" claim, which carries the Juju user tag.
++func jwtSubClaim(base64JWT string) (string, error) {
++	raw, err := base64.StdEncoding.DecodeString(base64JWT)
++	if err != nil {
++		return "", errors.Annotate(err, "base64 decode JWT")
++	}
++	parts := strings.Split(string(raw), ".")
++	if len(parts) != 3 {
++		return "", fmt.Errorf("malformed JWT: expected 3 parts, got %d", len(parts))
++	}
++	// JWT uses base64url (no padding); use RawURLEncoding.
++	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
++	if err != nil {
++		return "", errors.Annotate(err, "base64url decode JWT payload")
++	}
++	var claims struct {
++		Sub string `json:"sub"`
++	}
++	if err := json.Unmarshal(payload, &claims); err != nil {
++		return "", errors.Annotate(err, "unmarshal JWT claims")
++	}
++	if claims.Sub == "" {
++		return "", fmt.Errorf("JWT missing sub claim")
++	}
++	return claims.Sub, nil
++}
+diff --git a/changes.patch b/changes.patch
+new file mode 100644
+index 0000000000..58d72ef814
+--- /dev/null
++++ b/changes.patch
+@@ -0,0 +1,275 @@
++diff --git a/cmd/juju/commands/main.go b/cmd/juju/commands/main.go
++index fe083147d3..f699b992fe 100644
++--- a/cmd/juju/commands/main.go
+++++ b/cmd/juju/commands/main.go
++@@ -5,9 +5,11 @@ package commands
++ 
++ import (
++ 	"context"
+++	"encoding/json"
++ 	"fmt"
++ 	"os"
++ 	"os/exec"
+++	"path/filepath"
++ 	"strings"
++ 
++ 	"github.com/juju/collections/set"
++@@ -214,7 +216,41 @@ func juju2xConfigDataExists() bool {
++ 
++ // NewJujuCommand creates the "juju" super command.
++ func NewJujuCommand(ctx *cmd.Context, jujuMsg string) cmd.Command {
++-	return NewJujuCommandWithStore(ctx, jujuclient.NewFileClientStore(), jujucmd.DefaultLog, jujuMsg, cliHelpHint, nil, false)
+++	return NewJujuCommandWithStore(ctx, clientStore(), jujucmd.DefaultLog, jujuMsg, cliHelpHint, nil, false)
+++}
+++
+++// clientStore returns a RemoteStore if an RCS session is available,
+++// otherwise falls back to the default file-backed store.
+++func clientStore() jujuclient.ClientStore {
+++	// First check env var for backward compatibility
+++	if addr := os.Getenv("REMOTE_CONTROLLER_STORE"); addr != "" {
+++		return jujuclient.NewRemoteStore(addr)
+++	}
+++
+++	// Check for RCS session file
+++	home, err := os.UserHomeDir()
+++	if err != nil {
+++		return jujuclient.NewFileClientStore()
+++	}
+++
+++	sessionPath := filepath.Join(home, ".local", "share", "rcs", "session.json")
+++
+++	b, err := os.ReadFile(sessionPath)
+++	if err != nil {
+++		// No session file, use default store
+++		return jujuclient.NewFileClientStore()
+++	}
+++
+++	var session struct {
+++		Token string `json:"token"`
+++		Addr  string `json:"addr"`
+++	}
+++	if err := json.Unmarshal(b, &session); err != nil || session.Addr == "" {
+++		// Invalid session or no server address, use default store
+++		return jujuclient.NewFileClientStore()
+++	}
+++
+++	return jujuclient.NewRemoteStore(session.Addr)
++ }
++ 
++ // NewJujuCommandWithStore creates the "juju" super command with the specified parameters.
++diff --git a/cmd/juju/commands/repl.go b/cmd/juju/commands/repl.go
++index 833d0c2cfe..0501d62d40 100644
++--- a/cmd/juju/commands/repl.go
+++++ b/cmd/juju/commands/repl.go
++@@ -33,7 +33,7 @@ type replCommand struct {
++ func newReplCommand(showHelp bool) cmd.Command {
++ 	return &replCommand{
++ 		showHelp:        showHelp,
++-		store:           jujuclient.NewFileClientStore(),
+++		store:           clientStore(),
++ 		execJujuCommand: cmd.Main,
++ 	}
++ }
++diff --git a/cmd/modelcmd/base.go b/cmd/modelcmd/base.go
++index 85888ec133..6bd6bad782 100644
++--- a/cmd/modelcmd/base.go
+++++ b/cmd/modelcmd/base.go
++@@ -6,10 +6,12 @@ package modelcmd
++ import (
++ 	"bufio"
++ 	"context"
+++	"encoding/json"
++ 	"fmt"
++ 	"io"
++ 	"net/http"
++ 	"os"
+++	"path/filepath"
++ 	"strings"
++ 
++ 	"github.com/go-macaroon-bakery/macaroon-bakery/v3/httpbakery"
++@@ -611,7 +613,13 @@ func newAPIConnectionParams(
++ 		return juju.NewAPIConnectionParams{}, errors.Annotatef(err, "getting controller %q", controllerName)
++ 	}
++ 
++-	if controllerDetails.OIDCLogin {
+++	if session, ok := loadRCSSessionFile(); ok {
+++		dialOpts.LoginProvider = api.NewRCSJWTLoginProvider(
+++			session.server,
+++			session.token,
+++			controllerName,
+++		)
+++	} else if controllerDetails.OIDCLogin {
++ 		// If the controller is OIDCLogin, we know it is capable of device and client credential flows.
++ 		dialOpts.LoginProvider = loginprovider.NewTryInOrderLoginProvider(
++ 			internallogger.GetLogger("juju.cmd.loginprovider"),
++@@ -821,3 +829,41 @@ func InnerCommand(c cmd.Command) cmd.Command {
++ 		c = c1.inner()
++ 	}
++ }
+++
+++// rcsSessionData holds the token and server URL loaded from the RCS session file.
+++type rcsSessionData struct {
+++	token  string
+++	server string
+++}
+++
+++// loadRCSSessionFile reads ~/.local/share/rcs/session.json and returns the
+++// session data. Returns false if the file is absent or invalid.
+++func loadRCSSessionFile() (rcsSessionData, bool) {
+++	if addr := os.Getenv("REMOTE_CONTROLLER_STORE"); addr != "" {
+++		token := os.Getenv("RCS_SESSION_TOKEN")
+++		if token != "" {
+++			return rcsSessionData{token: token, server: addr}, true
+++		}
+++	}
+++
+++	home, err := os.UserHomeDir()
+++	if err != nil {
+++		return rcsSessionData{}, false
+++	}
+++
+++	sessionPath := filepath.Join(home, ".local", "share", "rcs", "session.json")
+++	b, err := os.ReadFile(sessionPath)
+++	if err != nil {
+++		return rcsSessionData{}, false
+++	}
+++
+++	var s struct {
+++		Token string `json:"token"`
+++		Addr  string `json:"addr"`
+++	}
+++	if err := json.Unmarshal(b, &s); err != nil || s.Token == "" || s.Addr == "" {
+++		return rcsSessionData{}, false
+++	}
+++
+++	return rcsSessionData{token: s.Token, server: s.Addr}, true
+++}
++diff --git a/go.mod b/go.mod
++index 3ee36a39d3..1fb1f6aabe 100644
++--- a/go.mod
+++++ b/go.mod
++@@ -16,6 +16,7 @@ require (
++ 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions v1.3.0
++ 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys v1.1.0
++ 	github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a
+++	github.com/ale8k/remote-juju-controller-store v0.0.0-00010101000000-000000000000
++ 	github.com/aws/aws-sdk-go-v2 v1.41.5
++ 	github.com/aws/aws-sdk-go-v2/config v1.29.9
++ 	github.com/aws/aws-sdk-go-v2/credentials v1.17.62
++@@ -141,6 +142,7 @@ require (
++ 	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5 // indirect
++ 	github.com/Rican7/retry v0.3.1 // indirect
++ 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
+++	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
++ 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 // indirect
++ 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.30 // indirect
++ 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.21 // indirect
++@@ -184,7 +186,7 @@ require (
++ 	github.com/godbus/dbus/v5 v5.0.4 // indirect
++ 	github.com/gofrs/flock v0.8.1 // indirect
++ 	github.com/gogo/protobuf v1.3.2 // indirect
++-	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
+++	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
++ 	github.com/golang/protobuf v1.5.4 // indirect
++ 	github.com/google/go-cmp v0.7.0 // indirect
++ 	github.com/google/go-dap v0.12.0 // indirect
++@@ -246,6 +248,7 @@ require (
++ 	github.com/muhlemmer/gu v0.3.1 // indirect
++ 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
++ 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
+++	github.com/oapi-codegen/runtime v1.4.0 // indirect
++ 	github.com/opencontainers/go-digest v1.0.0 // indirect
++ 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
++ 	github.com/pkg/errors v0.9.1 // indirect
++@@ -278,7 +281,7 @@ require (
++ 	go.starlark.net v0.0.0-20250906160240-bf296ed553ea // indirect
++ 	go.yaml.in/yaml/v2 v2.4.3 // indirect
++ 	go.yaml.in/yaml/v3 v3.0.4 // indirect
++-	golang.org/x/arch v0.11.0 // indirect
+++	golang.org/x/arch v0.22.0 // indirect
++ 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
++ 	golang.org/x/mod v0.33.0 // indirect
++ 	golang.org/x/telemetry v0.0.0-20260209163413-e7419c687ee4 // indirect
++@@ -313,3 +316,5 @@ replace gopkg.in/check.v1 => github.com/hpidcock/gc-compat-tc v0.0.0-20260112233
++ replace github.com/juju/testing => ./internal/testhelpers/compat
++ 
++ replace go.opencensus.io => github.com/census-instrumentation/opencensus-go v0.24.0
+++
+++replace github.com/ale8k/remote-juju-controller-store => ../test/remote-controller-store
++diff --git a/go.sum b/go.sum
++index 0a47124b6f..9c3b70d346 100644
++--- a/go.sum
+++++ b/go.sum
++@@ -51,8 +51,8 @@ github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1/go.mo
++ github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1 h1:8BKxhZZLX/WosEeoCvWysmKUscfa9v8LIPEEU0JjE2o=
++ github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
++ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
++-github.com/BurntSushi/toml v1.1.0 h1:ksErzDEI1khOiGPgpwuI7x2ebx/uXQNw7xJpn9Eq1+I=
++-github.com/BurntSushi/toml v1.1.0/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
+++github.com/BurntSushi/toml v1.3.2 h1:o7IhLm0Msx3BaB+n3Ag7L8EVlByGnpq14C4YWiu/gL8=
+++github.com/BurntSushi/toml v1.3.2/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
++ github.com/ChrisTrenkamp/goxpath v0.0.0-20210404020558-97928f7e12b6/go.mod h1:nuWgzSkT5PnyOd+272uUmV0dnAnAn42Mk7PiQC5VzN4=
++ github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a h1:D9u6wYxZ2bPjDwYYq25y+n6ZmOKj/TsAMGSl4xL1yQI=
++ github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a/go.mod h1:pzTfWeRUe2RpUHYF4s8PfLt7C3jnxg62RX10Eh9myYY=
++@@ -62,10 +62,13 @@ github.com/Microsoft/go-winio v0.5.2 h1:a9IhgEQBCUEk6QCdml9CiJGhAws+YwffDHEMp1VM
++ github.com/Microsoft/go-winio v0.5.2/go.mod h1:WpS1mjBmmwHBEWmogvA2mj8546UReBk4v8QkMxJ6pZY=
++ github.com/Microsoft/hcsshim v0.9.4 h1:mnUj0ivWy6UzbB1uLFqKR6F+ZyiDc7j4iGgHTpO+5+I=
++ github.com/Microsoft/hcsshim v0.9.4/go.mod h1:7pLA8lDk46WKDWlVsENo92gC0XFa8rbKfyFRBqxEbCc=
+++github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
++ github.com/Rican7/retry v0.3.1 h1:scY4IbO8swckzoA/11HgBwaZRJEyY9vaNJshcdhp1Mc=
++ github.com/Rican7/retry v0.3.1/go.mod h1:CxSDrhAyXmTMeEuRAnArMu1FHu48vtfjLREWqVl7Vw0=
++ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFIImctFaOjnTIavg87rW78vTPkQqLI8=
++ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
+++github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
+++github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
++ github.com/armon/go-radix v0.0.0-20180808171621-7fddfc383310/go.mod h1:ufUuZ+zHj4x4TnLV4JWEpy2hxWSpsRywHrMgIH9cCH8=
++ github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=
++ github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5/go.mod h1:wHh0iHkYZB8zMSxRWpUBQtwG5a7fFgvEO+odwuTv2gs=
++@@ -114,6 +117,8 @@ github.com/aws/smithy-go v1.24.2/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqx
++ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
++ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
++ github.com/bgentry/speakeasy v0.1.0/go.mod h1:+zsyZBPWlz7T6j88CTgSN5bM796AkVf0kBD4zp0CCIs=
+++github.com/bmatcuk/doublestar v1.1.1 h1:YroD6BJCZBYx06yYFEWvUuKVWQn3vLLQAVmDmvTSaiQ=
+++github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=
++ github.com/bmatcuk/doublestar/v4 v4.9.1 h1:X8jg9rRZmJd4yRy7ZeNDRnM+T3ZfHv15JiBJ/avrEXE=
++ github.com/bmatcuk/doublestar/v4 v4.9.1/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
++ github.com/bmizerany/pat v0.0.0-20210406213842-e4b6760bdd6f h1:gOO/tNZMjjvTKZWpY7YnXC72ULNLErRtp94LountVE8=
++@@ -258,8 +263,8 @@ github.com/gofrs/flock v0.8.1/go.mod h1:F1TvTiK9OcQqauNUHlbJvyl9Qa1QvF/gOUDKA14j
++ github.com/gofrs/uuid v4.2.0+incompatible/go.mod h1:b2aQJv3Z4Fp6yNu3cdSllBxTCLRxnplIgP/c0N/04lM=
++ github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
++ github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
++-github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
++-github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
+++github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
+++github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
++ github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
++ github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da h1:oI5xCqsCo564l8iNU+DwB5epxmsaqB+rhGL0m5jtYqE=
++ github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da/go.mod h1:cIg4eruTrX1D+g88fzRXU5OdNfaM+9IcxsU14FzY7Hc=
++@@ -631,6 +636,8 @@ github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f h1:y5//uYreIhSUg3J
++ github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f/go.mod h1:ZdcZmHo+o7JKHSa8/e818NopupXU1YMK5fe1lsApnBw=
++ github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
++ github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d/go.mod h1:YUTz3bUH2ZwIWBy3CJBeOBEugqcmXREj14T+iG/4k4U=
+++github.com/oapi-codegen/runtime v1.4.0 h1:KLOSFOp7UzkbS7Cs1ms6NBEKYr0WmH2wZG0KKbd2er4=
+++github.com/oapi-codegen/runtime v1.4.0/go.mod h1:5sw5fxCDmnOzKNYmkVNF8d34kyUeejJEY8HNT2WaPec=
++ github.com/onsi/ginkgo/v2 v2.21.0 h1:7rg/4f3rB88pb5obDgNZrNHrQ4e6WpjonchcpuBRnZM=
++ github.com/onsi/ginkgo/v2 v2.21.0/go.mod h1:7Du3c42kxCUegi0IImZ1wUQzMBVecgIHjR1C+NkhLQo=
++ github.com/onsi/gomega v1.35.1 h1:Cwbd75ZBPxFSuZ6T+rN/WCb/gOc6YgFBXLlZLhC7Ds4=
++@@ -699,6 +706,7 @@ github.com/spf13/cobra v1.10.2/go.mod h1:7C1pvHqHw5A4vrJfjNwvOdzYu0Gml16OCs2GRiT
++ github.com/spf13/pflag v1.0.9/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
++ github.com/spf13/pflag v1.0.10 h1:4EBh2KAYBwaONj6b2Ye1GiHfwjqyROoF4RwYO+vPwFk=
++ github.com/spf13/pflag v1.0.10/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
+++github.com/spkg/bom v0.0.0-20160624110644-59b7046e48ad/go.mod h1:qLr4V1qq6nMqFKkMo8ZTx3f+BZEkzsRUY10Xsm2mwU0=
++ github.com/std-uritemplate/std-uritemplate/go v0.0.47 h1:erzz/DR4sOzWr0ca2MgSTkMckpLEsDySaTZwVFQq9zw=
++ github.com/std-uritemplate/std-uritemplate/go v0.0.47/go.mod h1:Qov4Ay4U83j37XjgxMYevGJFLbnZ2o9cEOhGufBKgKY=
++ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
++@@ -776,8 +784,8 @@ go.yaml.in/yaml/v2 v2.4.3 h1:6gvOSjQoTB3vt1l+CU+tSyi/HOjfOjRLJ4YwYZGwRO0=
++ go.yaml.in/yaml/v2 v2.4.3/go.mod h1:zSxWcmIDjOzPXpjlTTbAsKokqkDNAVtZO0WOMiT90s8=
++ go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
++ go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
++-golang.org/x/arch v0.11.0 h1:KXV8WWKCXm6tRpLirl2szsO5j/oOODwZf4hATmGVNs4=
++-golang.org/x/arch v0.11.0/go.mod h1:FEVrYAQjsQXMVJ1nsMoVVXPZg6p2JE2mx8psSWTDQys=
+++golang.org/x/arch v0.22.0 h1:c/Zle32i5ttqRXjdLyyHZESLD/bB90DCU1g9l/0YBDI=
+++golang.org/x/arch v0.22.0/go.mod h1:dNHoOeKiyja7GTvF9NJS1l3Z2yntpQNzgrjh1cU103A=
++ golang.org/x/crypto v0.0.0-20180214000028-650f4a345ab4/go.mod h1:6SG95UA2DQfeDnfUPMdvaQW0Q7yPrPDi9nlGo2tz2b4=
++ golang.org/x/crypto v0.0.0-20180723164146-c126467f60eb/go.mod h1:6SG95UA2DQfeDnfUPMdvaQW0Q7yPrPDi9nlGo2tz2b4=
++ golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
+diff --git a/cmd/juju/commands/main.go b/cmd/juju/commands/main.go
+index fe083147d3..f699b992fe 100644
+--- a/cmd/juju/commands/main.go
++++ b/cmd/juju/commands/main.go
+@@ -5,9 +5,11 @@ package commands
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/juju/collections/set"
+@@ -214,7 +216,41 @@ func juju2xConfigDataExists() bool {
+ 
+ // NewJujuCommand creates the "juju" super command.
+ func NewJujuCommand(ctx *cmd.Context, jujuMsg string) cmd.Command {
+-	return NewJujuCommandWithStore(ctx, jujuclient.NewFileClientStore(), jujucmd.DefaultLog, jujuMsg, cliHelpHint, nil, false)
++	return NewJujuCommandWithStore(ctx, clientStore(), jujucmd.DefaultLog, jujuMsg, cliHelpHint, nil, false)
++}
++
++// clientStore returns a RemoteStore if an RCS session is available,
++// otherwise falls back to the default file-backed store.
++func clientStore() jujuclient.ClientStore {
++	// First check env var for backward compatibility
++	if addr := os.Getenv("REMOTE_CONTROLLER_STORE"); addr != "" {
++		return jujuclient.NewRemoteStore(addr)
++	}
++
++	// Check for RCS session file
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return jujuclient.NewFileClientStore()
++	}
++
++	sessionPath := filepath.Join(home, ".local", "share", "rcs", "session.json")
++
++	b, err := os.ReadFile(sessionPath)
++	if err != nil {
++		// No session file, use default store
++		return jujuclient.NewFileClientStore()
++	}
++
++	var session struct {
++		Token string `json:"token"`
++		Addr  string `json:"addr"`
++	}
++	if err := json.Unmarshal(b, &session); err != nil || session.Addr == "" {
++		// Invalid session or no server address, use default store
++		return jujuclient.NewFileClientStore()
++	}
++
++	return jujuclient.NewRemoteStore(session.Addr)
+ }
+ 
+ // NewJujuCommandWithStore creates the "juju" super command with the specified parameters.
+diff --git a/cmd/juju/commands/repl.go b/cmd/juju/commands/repl.go
+index 833d0c2cfe..0501d62d40 100644
+--- a/cmd/juju/commands/repl.go
++++ b/cmd/juju/commands/repl.go
+@@ -33,7 +33,7 @@ type replCommand struct {
+ func newReplCommand(showHelp bool) cmd.Command {
+ 	return &replCommand{
+ 		showHelp:        showHelp,
+-		store:           jujuclient.NewFileClientStore(),
++		store:           clientStore(),
+ 		execJujuCommand: cmd.Main,
+ 	}
+ }
+diff --git a/cmd/modelcmd/base.go b/cmd/modelcmd/base.go
+index 85888ec133..6bd6bad782 100644
+--- a/cmd/modelcmd/base.go
++++ b/cmd/modelcmd/base.go
+@@ -6,10 +6,12 @@ package modelcmd
+ import (
+ 	"bufio"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 
+ 	"github.com/go-macaroon-bakery/macaroon-bakery/v3/httpbakery"
+@@ -611,7 +613,13 @@ func newAPIConnectionParams(
+ 		return juju.NewAPIConnectionParams{}, errors.Annotatef(err, "getting controller %q", controllerName)
+ 	}
+ 
+-	if controllerDetails.OIDCLogin {
++	if session, ok := loadRCSSessionFile(); ok {
++		dialOpts.LoginProvider = api.NewRCSJWTLoginProvider(
++			session.server,
++			session.token,
++			controllerName,
++		)
++	} else if controllerDetails.OIDCLogin {
+ 		// If the controller is OIDCLogin, we know it is capable of device and client credential flows.
+ 		dialOpts.LoginProvider = loginprovider.NewTryInOrderLoginProvider(
+ 			internallogger.GetLogger("juju.cmd.loginprovider"),
+@@ -821,3 +829,41 @@ func InnerCommand(c cmd.Command) cmd.Command {
+ 		c = c1.inner()
+ 	}
+ }
++
++// rcsSessionData holds the token and server URL loaded from the RCS session file.
++type rcsSessionData struct {
++	token  string
++	server string
++}
++
++// loadRCSSessionFile reads ~/.local/share/rcs/session.json and returns the
++// session data. Returns false if the file is absent or invalid.
++func loadRCSSessionFile() (rcsSessionData, bool) {
++	if addr := os.Getenv("REMOTE_CONTROLLER_STORE"); addr != "" {
++		token := os.Getenv("RCS_SESSION_TOKEN")
++		if token != "" {
++			return rcsSessionData{token: token, server: addr}, true
++		}
++	}
++
++	home, err := os.UserHomeDir()
++	if err != nil {
++		return rcsSessionData{}, false
++	}
++
++	sessionPath := filepath.Join(home, ".local", "share", "rcs", "session.json")
++	b, err := os.ReadFile(sessionPath)
++	if err != nil {
++		return rcsSessionData{}, false
++	}
++
++	var s struct {
++		Token string `json:"token"`
++		Addr  string `json:"addr"`
++	}
++	if err := json.Unmarshal(b, &s); err != nil || s.Token == "" || s.Addr == "" {
++		return rcsSessionData{}, false
++	}
++
++	return rcsSessionData{token: s.Token, server: s.Addr}, true
++}
+diff --git a/go.mod b/go.mod
+index 3ee36a39d3..1fb1f6aabe 100644
+--- a/go.mod
++++ b/go.mod
+@@ -16,6 +16,7 @@ require (
+ 	github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions v1.3.0
+ 	github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys v1.1.0
+ 	github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a
++	github.com/ale8k/remote-juju-controller-store v0.0.0-00010101000000-000000000000
+ 	github.com/aws/aws-sdk-go-v2 v1.41.5
+ 	github.com/aws/aws-sdk-go-v2/config v1.29.9
+ 	github.com/aws/aws-sdk-go-v2/credentials v1.17.62
+@@ -141,6 +142,7 @@ require (
+ 	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5 // indirect
+ 	github.com/Rican7/retry v0.3.1 // indirect
+ 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
++	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
+ 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.8 // indirect
+ 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.30 // indirect
+ 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.21 // indirect
+@@ -184,7 +186,7 @@ require (
+ 	github.com/godbus/dbus/v5 v5.0.4 // indirect
+ 	github.com/gofrs/flock v0.8.1 // indirect
+ 	github.com/gogo/protobuf v1.3.2 // indirect
+-	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
++	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
+ 	github.com/golang/protobuf v1.5.4 // indirect
+ 	github.com/google/go-cmp v0.7.0 // indirect
+ 	github.com/google/go-dap v0.12.0 // indirect
+@@ -246,6 +248,7 @@ require (
+ 	github.com/muhlemmer/gu v0.3.1 // indirect
+ 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f // indirect
++	github.com/oapi-codegen/runtime v1.4.0 // indirect
+ 	github.com/opencontainers/go-digest v1.0.0 // indirect
+ 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
+@@ -278,7 +281,7 @@ require (
+ 	go.starlark.net v0.0.0-20250906160240-bf296ed553ea // indirect
+ 	go.yaml.in/yaml/v2 v2.4.3 // indirect
+ 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+-	golang.org/x/arch v0.11.0 // indirect
++	golang.org/x/arch v0.22.0 // indirect
+ 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
+ 	golang.org/x/mod v0.33.0 // indirect
+ 	golang.org/x/telemetry v0.0.0-20260209163413-e7419c687ee4 // indirect
+@@ -313,3 +316,5 @@ replace gopkg.in/check.v1 => github.com/hpidcock/gc-compat-tc v0.0.0-20260112233
+ replace github.com/juju/testing => ./internal/testhelpers/compat
+ 
+ replace go.opencensus.io => github.com/census-instrumentation/opencensus-go v0.24.0
++
++replace github.com/ale8k/remote-juju-controller-store => ../test/remote-controller-store
+diff --git a/go.sum b/go.sum
+index 0a47124b6f..9c3b70d346 100644
+--- a/go.sum
++++ b/go.sum
+@@ -51,8 +51,8 @@ github.com/AzureAD/microsoft-authentication-extensions-for-go/cache v0.1.1/go.mo
+ github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1 h1:8BKxhZZLX/WosEeoCvWysmKUscfa9v8LIPEEU0JjE2o=
+ github.com/AzureAD/microsoft-authentication-library-for-go v1.4.1/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
+ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+-github.com/BurntSushi/toml v1.1.0 h1:ksErzDEI1khOiGPgpwuI7x2ebx/uXQNw7xJpn9Eq1+I=
+-github.com/BurntSushi/toml v1.1.0/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
++github.com/BurntSushi/toml v1.3.2 h1:o7IhLm0Msx3BaB+n3Ag7L8EVlByGnpq14C4YWiu/gL8=
++github.com/BurntSushi/toml v1.3.2/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
+ github.com/ChrisTrenkamp/goxpath v0.0.0-20210404020558-97928f7e12b6/go.mod h1:nuWgzSkT5PnyOd+272uUmV0dnAnAn42Mk7PiQC5VzN4=
+ github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a h1:D9u6wYxZ2bPjDwYYq25y+n6ZmOKj/TsAMGSl4xL1yQI=
+ github.com/EvilSuperstars/go-cidrman v0.0.0-20190607145828-28e79e32899a/go.mod h1:pzTfWeRUe2RpUHYF4s8PfLt7C3jnxg62RX10Eh9myYY=
+@@ -62,10 +62,13 @@ github.com/Microsoft/go-winio v0.5.2 h1:a9IhgEQBCUEk6QCdml9CiJGhAws+YwffDHEMp1VM
+ github.com/Microsoft/go-winio v0.5.2/go.mod h1:WpS1mjBmmwHBEWmogvA2mj8546UReBk4v8QkMxJ6pZY=
+ github.com/Microsoft/hcsshim v0.9.4 h1:mnUj0ivWy6UzbB1uLFqKR6F+ZyiDc7j4iGgHTpO+5+I=
+ github.com/Microsoft/hcsshim v0.9.4/go.mod h1:7pLA8lDk46WKDWlVsENo92gC0XFa8rbKfyFRBqxEbCc=
++github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
+ github.com/Rican7/retry v0.3.1 h1:scY4IbO8swckzoA/11HgBwaZRJEyY9vaNJshcdhp1Mc=
+ github.com/Rican7/retry v0.3.1/go.mod h1:CxSDrhAyXmTMeEuRAnArMu1FHu48vtfjLREWqVl7Vw0=
+ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be h1:9AeTilPcZAjCFIImctFaOjnTIavg87rW78vTPkQqLI8=
+ github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be/go.mod h1:ySMOLuWl6zY27l47sB3qLNK6tF2fkHG55UZxx8oIVo4=
++github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
++github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
+ github.com/armon/go-radix v0.0.0-20180808171621-7fddfc383310/go.mod h1:ufUuZ+zHj4x4TnLV4JWEpy2hxWSpsRywHrMgIH9cCH8=
+ github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=
+ github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5/go.mod h1:wHh0iHkYZB8zMSxRWpUBQtwG5a7fFgvEO+odwuTv2gs=
+@@ -114,6 +117,8 @@ github.com/aws/smithy-go v1.24.2/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqx
+ github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
+ github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
+ github.com/bgentry/speakeasy v0.1.0/go.mod h1:+zsyZBPWlz7T6j88CTgSN5bM796AkVf0kBD4zp0CCIs=
++github.com/bmatcuk/doublestar v1.1.1 h1:YroD6BJCZBYx06yYFEWvUuKVWQn3vLLQAVmDmvTSaiQ=
++github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=
+ github.com/bmatcuk/doublestar/v4 v4.9.1 h1:X8jg9rRZmJd4yRy7ZeNDRnM+T3ZfHv15JiBJ/avrEXE=
+ github.com/bmatcuk/doublestar/v4 v4.9.1/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
+ github.com/bmizerany/pat v0.0.0-20210406213842-e4b6760bdd6f h1:gOO/tNZMjjvTKZWpY7YnXC72ULNLErRtp94LountVE8=
+@@ -258,8 +263,8 @@ github.com/gofrs/flock v0.8.1/go.mod h1:F1TvTiK9OcQqauNUHlbJvyl9Qa1QvF/gOUDKA14j
+ github.com/gofrs/uuid v4.2.0+incompatible/go.mod h1:b2aQJv3Z4Fp6yNu3cdSllBxTCLRxnplIgP/c0N/04lM=
+ github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
+ github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
+-github.com/golang-jwt/jwt/v5 v5.3.0 h1:pv4AsKCKKZuqlgs5sUmn4x8UlGa0kEVt/puTpKx9vvo=
+-github.com/golang-jwt/jwt/v5 v5.3.0/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
++github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
++github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
+ github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
+ github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da h1:oI5xCqsCo564l8iNU+DwB5epxmsaqB+rhGL0m5jtYqE=
+ github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da/go.mod h1:cIg4eruTrX1D+g88fzRXU5OdNfaM+9IcxsU14FzY7Hc=
+@@ -631,6 +636,8 @@ github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f h1:y5//uYreIhSUg3J
+ github.com/mxk/go-flowrate v0.0.0-20140419014527-cca7078d478f/go.mod h1:ZdcZmHo+o7JKHSa8/e818NopupXU1YMK5fe1lsApnBw=
+ github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
+ github.com/nu7hatch/gouuid v0.0.0-20131221200532-179d4d0c4d8d/go.mod h1:YUTz3bUH2ZwIWBy3CJBeOBEugqcmXREj14T+iG/4k4U=
++github.com/oapi-codegen/runtime v1.4.0 h1:KLOSFOp7UzkbS7Cs1ms6NBEKYr0WmH2wZG0KKbd2er4=
++github.com/oapi-codegen/runtime v1.4.0/go.mod h1:5sw5fxCDmnOzKNYmkVNF8d34kyUeejJEY8HNT2WaPec=
+ github.com/onsi/ginkgo/v2 v2.21.0 h1:7rg/4f3rB88pb5obDgNZrNHrQ4e6WpjonchcpuBRnZM=
+ github.com/onsi/ginkgo/v2 v2.21.0/go.mod h1:7Du3c42kxCUegi0IImZ1wUQzMBVecgIHjR1C+NkhLQo=
+ github.com/onsi/gomega v1.35.1 h1:Cwbd75ZBPxFSuZ6T+rN/WCb/gOc6YgFBXLlZLhC7Ds4=
+@@ -699,6 +706,7 @@ github.com/spf13/cobra v1.10.2/go.mod h1:7C1pvHqHw5A4vrJfjNwvOdzYu0Gml16OCs2GRiT
+ github.com/spf13/pflag v1.0.9/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
+ github.com/spf13/pflag v1.0.10 h1:4EBh2KAYBwaONj6b2Ye1GiHfwjqyROoF4RwYO+vPwFk=
+ github.com/spf13/pflag v1.0.10/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
++github.com/spkg/bom v0.0.0-20160624110644-59b7046e48ad/go.mod h1:qLr4V1qq6nMqFKkMo8ZTx3f+BZEkzsRUY10Xsm2mwU0=
+ github.com/std-uritemplate/std-uritemplate/go v0.0.47 h1:erzz/DR4sOzWr0ca2MgSTkMckpLEsDySaTZwVFQq9zw=
+ github.com/std-uritemplate/std-uritemplate/go v0.0.47/go.mod h1:Qov4Ay4U83j37XjgxMYevGJFLbnZ2o9cEOhGufBKgKY=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+@@ -776,8 +784,8 @@ go.yaml.in/yaml/v2 v2.4.3 h1:6gvOSjQoTB3vt1l+CU+tSyi/HOjfOjRLJ4YwYZGwRO0=
+ go.yaml.in/yaml/v2 v2.4.3/go.mod h1:zSxWcmIDjOzPXpjlTTbAsKokqkDNAVtZO0WOMiT90s8=
+ go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
+ go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
+-golang.org/x/arch v0.11.0 h1:KXV8WWKCXm6tRpLirl2szsO5j/oOODwZf4hATmGVNs4=
+-golang.org/x/arch v0.11.0/go.mod h1:FEVrYAQjsQXMVJ1nsMoVVXPZg6p2JE2mx8psSWTDQys=
++golang.org/x/arch v0.22.0 h1:c/Zle32i5ttqRXjdLyyHZESLD/bB90DCU1g9l/0YBDI=
++golang.org/x/arch v0.22.0/go.mod h1:dNHoOeKiyja7GTvF9NJS1l3Z2yntpQNzgrjh1cU103A=
+ golang.org/x/crypto v0.0.0-20180214000028-650f4a345ab4/go.mod h1:6SG95UA2DQfeDnfUPMdvaQW0Q7yPrPDi9nlGo2tz2b4=
+ golang.org/x/crypto v0.0.0-20180723164146-c126467f60eb/go.mod h1:6SG95UA2DQfeDnfUPMdvaQW0Q7yPrPDi9nlGo2tz2b4=
+ golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=

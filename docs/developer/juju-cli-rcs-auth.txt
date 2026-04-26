@@ -1,0 +1,67 @@
+Juju CLI with RCS Auth
+======================
+
+Part 1: How Juju switches to RCS mode
+-------------------------------------
+
+Client store selection
+----------------------
+Juju chooses the client store in cmd/juju/commands/main.go:
+
+1. If REMOTE_CONTROLLER_STORE is set, Juju uses RemoteStore directly.
+2. Otherwise Juju checks for ~/.local/share/rcs/session.json.
+3. If the file is valid and has addr, Juju uses RemoteStore(addr).
+4. If not present/invalid, Juju falls back to the normal file-backed store.
+
+So session.json presence is the automatic switch that puts Juju in RCS-backed
+client-store mode.
+
+Login provider wiring
+---------------------
+In cmd/modelcmd/base.go, newAPIConnectionParams loads RCS session data.
+If token+server are available, Juju sets:
+- DialOpts.LoginProvider = api.NewRCSJWTLoginProvider(server, token, controllerName)
+
+This means controller API login uses the RCS JWT login provider instead of the
+usual password/session-token login flow.
+
+Part 2: Session token to single-use controller JWT exchange
+-----------------------------------------------------------
+
+High-level flow per connection
+------------------------------
+1. Juju needs to connect to controller C.
+2. RCSJWTLoginProvider calls rcsd:
+   POST /controllers/C/token
+   Authorization: Bearer <rcs-session-jwt>
+3. rcsd authenticates the session token and resolves current user email.
+4. rcsd mints a short-lived controller JWT for that external user.
+   - sub: user-<email>
+   - aud: [controller-uuid]
+   - iss: rcsd
+   - jti: random uuid
+   - exp: now + 60s
+   - access: {controller-<uuid>: superuser}
+5. rcsd base64-encodes that JWT and returns it as token.
+6. Juju login provider decodes JWT payload (without signature verify) only to
+   read sub and set AuthTag.
+7. Juju sends Admin.Login with:
+   - AuthTag = sub from JWT
+   - Token = base64-encoded JWT
+8. Controller validates JWT signature using RCS JWKS and logs in the external
+   user identity.
+
+Why this is called single-use/ephemeral in practice
+----------------------------------------------------
+- A fresh token is minted on each login attempt.
+- Token expiry is short (60 seconds).
+- Provider also mints fresh tokens for HTTP auth header paths when needed.
+
+Important files
+---------------
+- Juju login provider: api/rcsjwtloginprovider.go
+- Juju auto-detect/session load: cmd/modelcmd/base.go
+- Juju store selection: cmd/juju/commands/main.go
+- RCS mint endpoint: internal/store/controllertoken.go
+- RCS auth middleware: internal/store/middleware.go
+- RCS JWKS endpoint: internal/store/jwks.go

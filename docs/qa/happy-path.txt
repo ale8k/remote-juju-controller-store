@@ -1,0 +1,85 @@
+RCS + Juju JWT Auth — Happy Path QA
+=====================================
+
+This guide walks through the full flow end-to-end:
+  RCS login → register controller → juju whoami → juju status
+
+Assumptions
+-----------
+- Keycloak and RCS services are available (docker-compose).
+- The juju CLI has been built from the patched branch.
+- A Juju controller has been bootstrapped and its UUID is known.
+- $RCS is the RCS server address, e.g. http://localhost:8484
+
+=============================================================================
+STEP 0 — Build & Reset
+=============================================================================
+
+# Build the juju CLI from source (needed once, or after code changes):
+  make install
+
+# Build the rcs CLI from source (needed once, or after code changes):
+  make build link
+
+# Stop docker compose
+  docker compose down 
+
+# Delete db in ./tmp of RCS
+
+# Start all backing services:
+  docker compose up -d --wait
+
+
+=============================================================================
+STEP 1 — Log in to RCS
+=============================================================================
+
+  ./rcs logout   # clear any existing session
+
+  ./rcs login http://localhost:8484
+  # Follow the device flow URL printed to the terminal.
+  # On success: "Logged in. Session saved."
+  # User is alice:alice
+
+Expected: ~/.local/share/rcs/session.json exists and contains {"token":"...","server":"..."}
+
+=============================================================================
+STEP 2 — rcs whoami (should show your email, not a UUID)
+=============================================================================
+
+  rcs whoami
+
+Expected output:
+  Server: http://localhost:8484
+  User:   your.name@example.com
+  Expiry: 2026-xx-xx xx:xx:xx UTC
+  In:     Xd Xh Xm
+
+=============================================================================
+STEP 3 — Bootstrap a Juju controller (skip if already bootstrapped)
+=============================================================================
+
+  juju controllers
+  # Expect no controllers to be present
+
+  # We use host bridge gateway to reach compose on 8484.
+  # Bridge addr:
+  lxc network list --format json | jq -r '.[] | select(.name=="lxdbr0") | .config["ipv4.address"] | split("/")[0]'
+  juju bootstrap lxd a --config login-token-refresh-url=http://<addr>:8484/.well-known/jwks.json --verbose
+
+
+  juju bootstrap lxd a --config login-token-refresh-url=http://$(lxc network list --format json | jq -r '.[] | select(.name=="lxdbr0") | .config["ipv4.address"] | split("/")[0]'):8484/.well-known/jwks.json --verbose
+
+
+
+=============================================================================
+STEP 4 - Run juju models
+=============================================================================
+
+If the authenticated user does not match the account details user, a mismatch is caught. The error would look as so:
+ERROR attempted login as "alice@example.com" for user "admin"
+
+Veryify juju models works.
+
+
+

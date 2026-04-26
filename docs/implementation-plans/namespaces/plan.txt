@@ -1,0 +1,136 @@
+Namespaces Implementation Plan
+
+Goal
+- Add namespace-aware storage and access control to RCS while keeping the first
+  cut SQL-backed and future-proof for OpenFGA.
+
+Outcomes
+- Users can create/list/use/delete namespaces.
+- All controller-store data is isolated by namespace.
+- Membership and role checks are enforced server-side.
+- CLI persists active namespace and sends it with API requests.
+
+Scope for First Cut
+- SQL-backed membership and authorization.
+- No OpenFGA enforcement yet (but keep an interface seam for later).
+
+Non-goals for First Cut
+- Full cross-service OpenFGA integration.
+- Complex policy expressions beyond owner/admin/member role checks.
+
+Design Decisions
+- Namespace identity: stable UUID id + unique human name.
+- Active namespace: selected by CLI and sent per request.
+- Membership model: owner, admin, member.
+- Server remains source of truth for access checks.
+
+Phases
+
+Phase 0: Contract and API shape
+1. Define namespace API payloads and errors.
+2. Decide transport for active namespace (header recommended).
+3. Document role semantics:
+   - owner: full control, including delete namespace.
+   - admin: manage members (except owner transfer unless explicitly allowed).
+   - member: read/write namespace-scoped resources.
+
+Phase 1: Database schema and migration
+1. Add namespaces table:
+   - id TEXT PRIMARY KEY
+   - name TEXT UNIQUE NOT NULL
+   - created_by TEXT NOT NULL
+   - created_at DATETIME default current timestamp
+2. Add namespace_members table:
+   - namespace_id TEXT NOT NULL
+   - user_id TEXT NOT NULL
+   - role TEXT NOT NULL
+   - created_at DATETIME default current timestamp
+   - UNIQUE(namespace_id, user_id)
+3. Add namespace_id to resource tables (or create namespace-scoped variants).
+4. Add indexes on namespace_id and membership lookups.
+5. Write idempotent migration logic for existing local databases.
+
+Phase 2: Server plumbing helpers
+1. Add helper to resolve active namespace from request.
+2. Add helper to validate membership and role.
+3. Add helper to load namespace by name/id.
+4. Add shared error helpers for 403/404 behavior consistency.
+
+Phase 3: Namespace management endpoints
+1. POST /namespaces: create namespace; creator becomes owner.
+2. GET /namespaces: list namespaces visible to caller.
+3. DELETE /namespaces/:name: owner-only; decide cascade behavior.
+4. PUT /namespaces/current: optional server-side preference endpoint.
+5. GET /namespaces/:name/users: membership listing.
+6. PUT/DELETE membership endpoints (if included in first cut):
+   - add/update member role
+   - remove member
+
+Phase 4: Scope existing store resources
+1. Add namespace filters to all resource queries.
+2. Ensure current/previous controller and model metadata are namespace-local.
+3. Ensure controller uniqueness rules are enforced per namespace where needed.
+4. Validate delete/update actions cannot cross namespace boundaries.
+
+Phase 5: CLI support
+1. Extend local session model to include active namespace.
+2. Add commands:
+   - rcs namespace create <name>
+   - rcs namespace list
+   - rcs namespace use <name>
+   - rcs namespace delete <name>
+   - rcs namespace users <name>
+3. Ensure client injects active namespace into each request.
+4. Ensure login/bootstrap defaults active namespace predictably.
+
+Phase 6: OpenAPI and generated client
+1. Add namespace endpoints and schemas to openapi spec.
+2. Add namespace header parameter for relevant endpoints.
+3. Regenerate client.
+4. Switch CLI calls to generated methods for namespace operations.
+
+Phase 7: Authorization seam for OpenFGA later
+1. Introduce Authz interface:
+   - CheckNamespaceAccess(user, namespace, action)
+   - ListNamespacesForUser(user)
+2. Implement SQL adapter first.
+3. Keep handlers dependent on interface, not raw SQL checks.
+4. Add placeholder OpenFGA adapter package behind same interface.
+
+Phase 8: Testing and verification
+1. DB tests:
+   - membership uniqueness
+   - namespace isolation
+2. API tests:
+   - unauthorized cross-namespace access denied
+   - owner/admin/member permissions
+   - namespace delete behavior
+3. CLI tests:
+   - session namespace persistence
+   - namespace command behavior
+   - request namespace propagation
+4. End-to-end smoke:
+   - user A and user B in different namespaces cannot see each other data
+   - shared namespace members can collaborate as expected
+
+Milestone Delivery Slices
+1. Slice A: schema + namespace create/list.
+2. Slice B: namespace use + CLI session persistence.
+3. Slice C: scope controllers/models by namespace.
+4. Slice D: scope accounts/credentials/bootstrap/cookies.
+5. Slice E: authz interface extraction.
+6. Slice F: optional OpenFGA adapter integration.
+
+Open Questions to Resolve Before Implementation
+1. Should namespace names be globally unique or owner-unique?
+2. Should namespace delete cascade data or soft-delete first?
+3. Do we need namespace transfer ownership in first cut?
+4. Is server-side current namespace preference required, or CLI-only state?
+5. Which endpoints should be namespace-agnostic (if any)?
+
+Definition of Done
+1. Namespace CRUD and membership checks are working.
+2. Resource reads/writes are isolated by namespace.
+3. CLI can select and persist active namespace.
+4. Tests cover isolation and role enforcement.
+5. Existing non-namespace behavior remains stable for single-namespace users.

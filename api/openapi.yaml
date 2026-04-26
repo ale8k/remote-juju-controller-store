@@ -1,0 +1,623 @@
+openapi: "3.0.3"
+info:
+  title: Remote Controller Store API
+  version: "0.1.0"
+  description: HTTP API for the remote Juju controller store daemon (rcsd).
+
+paths:
+  /.well-known/jwks.json:
+    get:
+      operationId: GetJWKS
+      summary: Get controller JWT verification keys
+      responses:
+        "200":
+          description: JSON Web Key Set (RFC 7517)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /auth/provider:
+    get:
+      operationId: GetAuthProvider
+      summary: Get OIDC provider configuration
+      responses:
+        "200":
+          description: OIDC provider config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthProviderResponse'
+
+  /auth/device:
+    post:
+      operationId: ExchangeDeviceToken
+      summary: Exchange a device flow access token for an RCS session token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceTokenRequest'
+      responses:
+        "200":
+          description: RCS session token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceTokenResponse'
+        "401":
+          description: Invalid or rejected token
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers:
+    get:
+      operationId: AllControllers
+      summary: List all controllers
+      responses:
+        "200":
+          description: Map of controller name to details JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  additionalProperties: true
+
+  /controllers/current:
+    get:
+      operationId: CurrentController
+      summary: Get the current controller name
+      responses:
+        "200":
+          description: Current controller name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NameResponse'
+        "404":
+          description: No current controller
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: SetCurrentController
+      summary: Set the current controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NameRequest'
+      responses:
+        "204":
+          description: Updated
+        "404":
+          description: Controller not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/previous:
+    get:
+      operationId: PreviousController
+      summary: Get the previous controller
+      responses:
+        "200":
+          description: Previous controller name and whether it was a switch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreviousControllerInfo'
+        "404":
+          description: No previous controller
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/by-endpoints:
+    post:
+      operationId: ControllerByAPIEndpoints
+      summary: Find a controller by its API endpoints
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: string
+      responses:
+        "200":
+          description: Matching controller name and details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllerLookupResponse'
+        "404":
+          description: No matching controller
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: ControllerByName
+      summary: Get a controller by name
+      responses:
+        "200":
+          description: Controller details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      operationId: AddController
+      summary: Add a new controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "201":
+          description: Created
+        "409":
+          description: Conflict — name or UUID already exists
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: UpdateController
+      summary: Update an existing controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "204":
+          description: Updated
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    delete:
+      operationId: RemoveController
+      summary: Remove a controller and its associated data
+      responses:
+        "204":
+          description: Removed
+
+  /controllers/{name}/token:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    post:
+      operationId: MintControllerToken
+      summary: Mint a short-lived JWT to log in to this controller
+      responses:
+        "200":
+          description: Base64-encoded RS256 JWT for use in LoginRequest.Token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllerTokenResponse'
+        "404":
+          description: Controller not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}/models:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: AllModels
+      summary: List all models for a controller
+      responses:
+        "200":
+          description: Map of model name to details JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  additionalProperties: true
+        "404":
+          description: No models found
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: SetModels
+      summary: Replace all models for a controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties:
+                type: object
+                additionalProperties: true
+      responses:
+        "204":
+          description: Replaced
+
+  /controllers/{name}/models/current:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: CurrentModel
+      summary: Get the current model for a controller
+      responses:
+        "200":
+          description: Current model name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NameResponse'
+        "404":
+          description: No current model
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: SetCurrentModel
+      summary: Set the current model for a controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NameRequest'
+      responses:
+        "204":
+          description: Updated
+        "404":
+          description: Model not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}/models/previous:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: PreviousModel
+      summary: Get the previous model for a controller
+      responses:
+        "200":
+          description: Previous model name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NameResponse'
+        "404":
+          description: No previous model
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}/models/{model}:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+      - $ref: '#/components/parameters/ModelName'
+    get:
+      operationId: ModelByName
+      summary: Get a specific model by name
+      responses:
+        "200":
+          description: Model details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: UpdateModel
+      summary: Create or update a model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "204":
+          description: Updated
+    delete:
+      operationId: RemoveModel
+      summary: Remove a model
+      responses:
+        "204":
+          description: Removed
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}/account:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: AccountDetails
+      summary: Get account details for a controller
+      responses:
+        "200":
+          description: Account details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: UpdateAccount
+      summary: Create or update account details
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "204":
+          description: Updated
+    delete:
+      operationId: RemoveAccount
+      summary: Remove account details
+      responses:
+        "204":
+          description: Removed
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /controllers/{name}/bootstrap:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: BootstrapConfig
+      summary: Get bootstrap config for a controller
+      responses:
+        "200":
+          description: Bootstrap config
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: UpdateBootstrapConfig
+      summary: Create or update bootstrap config
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "204":
+          description: Updated
+
+  /controllers/{name}/cookies:
+    parameters:
+      - $ref: '#/components/parameters/ControllerName'
+    get:
+      operationId: GetCookies
+      summary: Get cookie jar for a controller
+      responses:
+        "200":
+          description: Cookie entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {}
+    put:
+      operationId: SaveCookies
+      summary: Save cookie jar for a controller
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: {}
+      responses:
+        "204":
+          description: Saved
+    delete:
+      operationId: RemoveAllCookies
+      summary: Remove all cookies for a controller
+      responses:
+        "204":
+          description: Removed
+
+  /credentials:
+    get:
+      operationId: AllCredentials
+      summary: List all credentials
+      responses:
+        "200":
+          description: Map of cloud name to credential details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  additionalProperties: true
+
+  /credentials/{cloud}:
+    parameters:
+      - $ref: '#/components/parameters/CloudName'
+    get:
+      operationId: CredentialForCloud
+      summary: Get credentials for a cloud
+      responses:
+        "200":
+          description: Credential details
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    put:
+      operationId: UpdateCredential
+      summary: Create or update credentials for a cloud
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "204":
+          description: Updated
+
+components:
+  parameters:
+    ControllerName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+    ModelName:
+      name: model
+      in: path
+      required: true
+      schema:
+        type: string
+    CloudName:
+      name: cloud
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    NameRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    NameResponse:
+      type: object
+      properties:
+        name:
+          type: string
+
+    PreviousControllerInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        switched:
+          type: boolean
+
+    ControllerLookupResponse:
+      type: object
+      properties:
+        name:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    AuthProviderResponse:
+      type: object
+      required: [issuer, client_id]
+      properties:
+        issuer:
+          type: string
+        client_id:
+          type: string
+
+    DeviceTokenRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+
+    DeviceTokenResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+
+    ControllerTokenResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string

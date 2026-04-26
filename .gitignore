@@ -1,0 +1,7 @@
+rcsd
+rcs
+*.db
+*.db-shm
+*.db-wal
+build
+tmp

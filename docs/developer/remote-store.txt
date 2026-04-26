@@ -1,0 +1,68 @@
+Remote Store Design
+===================
+
+Overview
+--------
+RemoteStore is Juju's ClientStore implementation backed by HTTP calls to rcsd
+instead of local YAML files.
+
+Juju side implementation
+------------------------
+File:
+- juju/api/jujuclient/remotestore.go
+
+Construction:
+- NewRemoteStore(addr) normalizes addr to a base URL and builds a generated
+  OpenAPI client.
+- Every request gets Authorization: Bearer <rcs-session-token> via
+  addAuthHeader.
+
+Session token source used by RemoteStore:
+1. RCS_SESSION_TOKEN env var (if set)
+2. otherwise ~/.local/share/rcs/session.json -> token field
+
+What it proxies
+---------------
+RemoteStore implements the same ClientStore interfaces Juju commands use:
+- controllers (get/add/update/remove/current/previous/by-endpoints)
+- models (get/set/update/remove/current/previous)
+- accounts (get/update/remove)
+- bootstrap config
+- credentials
+- cookie jar load/save
+
+Error mapping
+-------------
+HTTP status codes are mapped to Juju-style errors:
+- 404 -> not found
+- 409 -> already exists
+- other non-2xx -> generic remote store error with response body
+
+Qualified model names
+---------------------
+Model names can include slash (example: admin/default).
+Path params break on slash, so individual model operations use:
+- /controllers/{name}/models/by-name?model=<qualified-model-name>
+
+Juju RemoteStore builds this URL with modelURL() and uses direct HTTP calls in
+ModelByName, UpdateModel, and RemoveModel.
+
+RCS server side implementation
+------------------------------
+Files:
+- internal/store/server.go
+- internal/store/models.go
+
+Route pattern:
+- GET  /controllers/:name/models/by-name?model=...
+- PUT  /controllers/:name/models/by-name?model=...
+- DELETE /controllers/:name/models/by-name?model=...
+
+All remote-store endpoints are behind AuthMiddleware, so every ClientStore
+operation is scoped to the authenticated RCS session.
+
+Behavioral note on accounts
+---------------------------
+accountDetails projects the current session user email into the returned
+account payload. This keeps Juju account user and JWT sub consistent when Juju
+connects through RCS JWT auth.

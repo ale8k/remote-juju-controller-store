@@ -1,0 +1,84 @@
+services:
+  rcsd:
+    image: cosmtrek/air
+    container_name: rcsd
+    working_dir: /app
+    command: -c local/air/.air.toml
+    volumes:
+      - .:/app
+      - go-modules:/go/pkg/mod
+      - go-cache:/root/.cache/go-build
+    ports:
+      - "8484:8484"
+    depends_on:
+      rcs-keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8484/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  rcs-keycloak:
+    image: docker.io/bitnamilegacy/keycloak:23
+    container_name: rcs-keycloak
+    environment:
+      KEYCLOAK_HTTP_PORT: 3082
+      KEYCLOAK_ENABLE_HEALTH_ENDPOINTS: true
+      KEYCLOAK_CREATE_ADMIN_USER: true
+      KEYCLOAK_ADMIN_USER: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_DATABASE_VENDOR: dev-file
+      KEYCLOAK_EXTRA_ARGS: >-
+        -Dkeycloak.migration.action=import
+        -Dkeycloak.migration.provider=singleFile
+        -Dkeycloak.migration.file=/bitnami/keycloak/data/import/realm.json
+        -Dkeycloak.migration.replace-placeholders=true
+        -Dkeycloak.profile.feature.upload_scripts=enabled
+    volumes:
+      - ./local/keycloak/rcs-realm.json:/bitnami/keycloak/data/import/realm.json:ro
+    ports:
+      - "3082:3082"
+    healthcheck:
+      test: ["CMD", "curl", "--head", "-fsS", "http://localhost:3082/health/ready"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  rcs-openfga-migrate:
+    image: openfga/openfga:latest
+    container_name: rcs-openfga-migrate
+    command: migrate
+    user: "0:0"
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=sqlite
+      - OPENFGA_DATASTORE_URI=file:/home/nonroot/tmp/openfga.db
+    volumes:
+      - ./tmp:/home/nonroot/tmp
+
+  rcs-openfga:
+    depends_on:
+      rcs-openfga-migrate:
+        condition: service_completed_successfully
+    image: openfga/openfga:latest
+    container_name: rcs-openfga
+    user: "0:0"
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=sqlite
+      - OPENFGA_DATASTORE_URI=file:/home/nonroot/tmp/openfga.db
+      - OPENFGA_LOG_FORMAT=json
+    command: run
+    volumes:
+      - ./tmp:/home/nonroot/tmp
+    ports:
+      # Needed for the http server
+      - "8080:8080"
+      # Needed for the grpc server (if used)
+      - "8081:8081"
+      # Needed for the playground (Do not enable in prod!)
+      - "3000:3000"
+
+volumes:
+  go-modules:
+  go-cache:
+
