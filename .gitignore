@@ -1,5 +1,5 @@
 rcsd
-rcs
+rcscli
 *.db
 *.db-shm
 *.db-wal
