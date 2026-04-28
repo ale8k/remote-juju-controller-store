@@ -54,6 +54,145 @@ paths:
               schema:
                 type: string
 
+  /namespaces:
+    get:
+      operationId: ListNamespaces
+      summary: List namespaces the authenticated user is a member of
+      responses:
+        "200":
+          description: List of namespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/NamespaceResponse'
+    post:
+      operationId: CreateNamespace
+      summary: Create a new namespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNamespaceRequest'
+      responses:
+        "201":
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewNamespaceInfo'
+        "409":
+          description: Namespace already exists
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /namespaces/{ns}:
+    parameters:
+      - name: ns
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: DeleteNamespace
+      summary: Delete a namespace and all its data (owner only)
+      responses:
+        "204":
+          description: Deleted
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /namespaces/{ns}/members:
+    parameters:
+      - name: ns
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: ListMembers
+      summary: List members of a namespace
+      responses:
+        "200":
+          description: List of member emails
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    post:
+      operationId: AddMember
+      summary: Add a user to a namespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddMemberRequest'
+      responses:
+        "204":
+          description: Added
+        "404":
+          description: Namespace or user not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /namespaces/{ns}/members/{email}:
+    parameters:
+      - name: ns
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: email
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: RemoveMember
+      summary: Remove a member from a namespace
+      responses:
+        "204":
+          description: Removed
+        "403":
+          description: Cannot remove owner
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "404":
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /controllers:
     get:
       operationId: AllControllers
@@ -562,6 +701,40 @@ components:
         type: string
 
   schemas:
+    NamespaceResponse:
+      type: object
+      required: [id, name, owner_id]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        owner_id:
+          type: string
+
+    CreateNamespaceRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+
+    NewNamespaceInfo:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+
+    AddMemberRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+
     NameRequest:
       type: object
       required: [name]

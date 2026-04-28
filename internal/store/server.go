@@ -78,11 +78,29 @@ func (s *Server) Routes() http.Handler {
 		auth.POST("/device", s.authDevice)
 	}
 
-	// All data endpoints require a valid RCS session JWT.
+	// authed: requires valid RCS session JWT but NOT a namespace.
+	// Used for namespace management where the namespace itself is the subject.
 	authed := r.Group("", AuthMiddleware(s.db, s.cfg.TokenExpiry))
 
+	// Namespace management — no namespace header required.
+	ns := authed.Group("/namespaces")
+	{
+		ns.GET("", s.listNamespaces)
+		ns.POST("", s.createNamespace)
+		ns.DELETE("/:ns", s.deleteNamespace)
+
+		// Membership management.
+		ns.GET("/:ns/members", s.listMembers)
+		ns.POST("/:ns/members", s.addMember)
+		ns.DELETE("/:ns/members/:email", s.removeMember)
+	}
+
+	// data: requires valid JWT AND namespace membership.
+	// All resource endpoints go here.
+	data := r.Group("", AuthMiddleware(s.db, s.cfg.TokenExpiry), NamespaceMiddleware(s.db))
+
 	// Controllers
-	ctrl := authed.Group("/controllers")
+	ctrl := data.Group("/controllers")
 	{
 		ctrl.GET("", s.allControllers)
 		ctrl.GET("/current", s.currentController)
@@ -126,7 +144,7 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	// Credentials
-	creds := authed.Group("/credentials")
+	creds := data.Group("/credentials")
 	{
 		creds.GET("", s.allCredentials)
 		creds.GET("/:cloud", s.credentialForCloud)

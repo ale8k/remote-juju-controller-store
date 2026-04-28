@@ -10,11 +10,14 @@ import (
 )
 
 func (s *Server) accountDetails(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
 
 	// Load any stored account first (e.g. written during bootstrap).
 	var details string
-	err := s.db.QueryRow("SELECT details_json FROM accounts WHERE controller_name=?", ctrl).Scan(&details)
+	err := s.db.QueryRow(
+		"SELECT details_json FROM accounts WHERE namespace_id=? AND controller_name=?", nsID, ctrl,
+	).Scan(&details)
 	if err != nil && err != sql.ErrNoRows {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -40,6 +43,8 @@ func (s *Server) accountDetails(c *gin.Context) {
 			}
 		}
 
+		// Virtual user fallback: return a minimal account if none is stored yet.
+		// This is critical during bootstrap before Juju has written the account.
 		virtual := map[string]any{
 			"user": userTag,
 		}
@@ -55,13 +60,11 @@ func (s *Server) accountDetails(c *gin.Context) {
 	}
 
 	// No stored account and no resolvable session identity.
-	if email == "" {
-		writeNotFound(c, fmt.Sprintf("no account for controller %q", ctrl))
-		return
-	}
+	writeNotFound(c, fmt.Sprintf("no account for controller %q", ctrl))
 }
 
 func (s *Server) updateAccount(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
 	var raw json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -69,8 +72,9 @@ func (s *Server) updateAccount(c *gin.Context) {
 		return
 	}
 	_, err := s.db.Exec(
-		"INSERT INTO accounts(controller_name,details_json) VALUES(?,?) ON CONFLICT(controller_name) DO UPDATE SET details_json=excluded.details_json",
-		ctrl, string(raw),
+		`INSERT INTO accounts(namespace_id,controller_name,details_json) VALUES(?,?,?)
+		 ON CONFLICT(namespace_id,controller_name) DO UPDATE SET details_json=excluded.details_json`,
+		nsID, ctrl, string(raw),
 	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
@@ -80,8 +84,11 @@ func (s *Server) updateAccount(c *gin.Context) {
 }
 
 func (s *Server) removeAccount(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
-	res, err := s.db.Exec("DELETE FROM accounts WHERE controller_name=?", ctrl)
+	res, err := s.db.Exec(
+		"DELETE FROM accounts WHERE namespace_id=? AND controller_name=?", nsID, ctrl,
+	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return

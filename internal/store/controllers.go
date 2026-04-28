@@ -10,7 +10,10 @@ import (
 )
 
 func (s *Server) allControllers(c *gin.Context) {
-	rows, err := s.db.Query("SELECT name, details_json FROM controllers")
+	nsID := namespaceIDFromContext(c)
+	rows, err := s.db.Query(
+		"SELECT name, details_json FROM controllers WHERE namespace_id=?", nsID,
+	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -30,9 +33,12 @@ func (s *Server) allControllers(c *gin.Context) {
 }
 
 func (s *Server) controllerByName(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	name := c.Param("name")
 	var details string
-	err := s.db.QueryRow("SELECT details_json FROM controllers WHERE name=?", name).Scan(&details)
+	err := s.db.QueryRow(
+		"SELECT details_json FROM controllers WHERE namespace_id=? AND name=?", nsID, name,
+	).Scan(&details)
 	if err == sql.ErrNoRows {
 		writeNotFound(c, fmt.Sprintf("controller %q not found", name))
 		return
@@ -45,6 +51,8 @@ func (s *Server) controllerByName(c *gin.Context) {
 }
 
 func (s *Server) addController(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
+	userID := userIDFromContext(c)
 	name := c.Param("name")
 	var raw json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -58,16 +66,18 @@ func (s *Server) addController(c *gin.Context) {
 		return
 	}
 
-	// Check name uniqueness.
+	// Check name uniqueness within namespace.
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM controllers WHERE name=?", name).Scan(&count)
+	_ = s.db.QueryRow(
+		"SELECT COUNT(*) FROM controllers WHERE namespace_id=? AND name=?", nsID, name,
+	).Scan(&count)
 	if count > 0 {
 		c.String(http.StatusConflict, fmt.Sprintf("controller with name %q already exists", name))
 		return
 	}
 
-	// Check UUID uniqueness.
-	rows, err := s.db.Query("SELECT details_json FROM controllers")
+	// Check UUID uniqueness within namespace.
+	rows, err := s.db.Query("SELECT details_json FROM controllers WHERE namespace_id=?", nsID)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -90,14 +100,41 @@ func (s *Server) addController(c *gin.Context) {
 	}
 	rows.Close()
 
-	if _, err := s.db.Exec("INSERT INTO controllers(name,details_json) VALUES(?,?)", name, string(raw)); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.Exec(
+		"INSERT INTO controllers(namespace_id,name,details_json) VALUES(?,?,?)",
+		nsID, name, string(raw),
+	); err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// Auto-grant superuser access to the bootstrapper.
+	if _, err := tx.Exec(
+		`INSERT INTO controller_access(namespace_id,controller_name,user_id,access)
+		 VALUES(?,?,?,'superuser') ON CONFLICT DO NOTHING`,
+		nsID, name, userID,
+	); err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	c.Status(http.StatusCreated)
 }
 
 func (s *Server) updateController(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	name := c.Param("name")
 	var raw json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -107,17 +144,21 @@ func (s *Server) updateController(c *gin.Context) {
 
 	// UpdateController requires the controller to exist.
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM controllers WHERE name=?", name).Scan(&count)
+	_ = s.db.QueryRow(
+		"SELECT COUNT(*) FROM controllers WHERE namespace_id=? AND name=?", nsID, name,
+	).Scan(&count)
 	if count == 0 {
 		writeNotFound(c, fmt.Sprintf("controller %q not found", name))
 		return
 	}
 
-	// Ensure no other controller has the same UUID.
+	// Ensure no other controller has the same UUID within this namespace.
 	var incoming controllerMin
 	_ = json.Unmarshal(raw, &incoming)
 	if incoming.ControllerUUID != "" {
-		rows, err := s.db.Query("SELECT name, details_json FROM controllers WHERE name != ?", name)
+		rows, err := s.db.Query(
+			"SELECT name, details_json FROM controllers WHERE namespace_id=? AND name != ?", nsID, name,
+		)
 		if err != nil {
 			c.String(http.StatusInternalServerError, err.Error())
 			return
@@ -139,7 +180,10 @@ func (s *Server) updateController(c *gin.Context) {
 		rows.Close()
 	}
 
-	if _, err := s.db.Exec("UPDATE controllers SET details_json=? WHERE name=?", string(raw), name); err != nil {
+	if _, err := s.db.Exec(
+		"UPDATE controllers SET details_json=? WHERE namespace_id=? AND name=?",
+		string(raw), nsID, name,
+	); err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -147,16 +191,19 @@ func (s *Server) updateController(c *gin.Context) {
 }
 
 func (s *Server) removeController(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	name := c.Param("name")
 
 	var detailsJSON string
-	err := s.db.QueryRow("SELECT details_json FROM controllers WHERE name=?", name).Scan(&detailsJSON)
+	err := s.db.QueryRow(
+		"SELECT details_json FROM controllers WHERE namespace_id=? AND name=?", nsID, name,
+	).Scan(&detailsJSON)
 	if err != nil && err != sql.ErrNoRows {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Gather all controller names sharing the same UUID (may not exist).
+	// Gather all controller names sharing the same UUID (within this namespace).
 	seen := map[string]bool{name: true}
 	toRemove := []string{name}
 
@@ -164,7 +211,9 @@ func (s *Server) removeController(c *gin.Context) {
 		var min controllerMin
 		_ = json.Unmarshal([]byte(detailsJSON), &min)
 		if min.ControllerUUID != "" {
-			rows, err := s.db.Query("SELECT name, details_json FROM controllers")
+			rows, err := s.db.Query(
+				"SELECT name, details_json FROM controllers WHERE namespace_id=?", nsID,
+			)
 			if err != nil {
 				c.String(http.StatusInternalServerError, err.Error())
 				return
@@ -177,7 +226,8 @@ func (s *Server) removeController(c *gin.Context) {
 					return
 				}
 				var m controllerMin
-				if err := json.Unmarshal([]byte(d), &m); err == nil && m.ControllerUUID == min.ControllerUUID && !seen[n] {
+				if err := json.Unmarshal([]byte(d), &m); err == nil &&
+					m.ControllerUUID == min.ControllerUUID && !seen[n] {
 					seen[n] = true
 					toRemove = append(toRemove, n)
 				}
@@ -188,21 +238,22 @@ func (s *Server) removeController(c *gin.Context) {
 
 	for _, n := range toRemove {
 		for _, stmt := range []string{
-			"DELETE FROM controllers WHERE name=?",
-			"DELETE FROM models WHERE controller_name=?",
-			"DELETE FROM model_meta WHERE controller_name=?",
-			"DELETE FROM accounts WHERE controller_name=?",
-			"DELETE FROM bootstrap_config WHERE controller_name=?",
-			"DELETE FROM cookie_jars WHERE controller_name=?",
+			"DELETE FROM controller_access WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM cookie_jars WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM bootstrap_config WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM accounts WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM model_meta WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM models WHERE namespace_id=? AND controller_name=?",
+			"DELETE FROM controllers WHERE namespace_id=? AND name=?",
 		} {
-			if _, err := s.db.Exec(stmt, n); err != nil {
+			if _, err := s.db.Exec(stmt, nsID, n); err != nil {
 				c.String(http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
 		// Clear current controller if it was one of the removed ones.
-		if cur, ok, _ := cmGet(s.db, "current"); ok && cur == n {
-			_ = cmSet(s.db, "current", "")
+		if cur, ok, _ := cmGet(s.db, nsID, "current"); ok && cur == n {
+			_ = cmSet(s.db, nsID, "current", "")
 		}
 	}
 
@@ -210,7 +261,8 @@ func (s *Server) removeController(c *gin.Context) {
 }
 
 func (s *Server) currentController(c *gin.Context) {
-	cur, ok, err := cmGet(s.db, "current")
+	nsID := namespaceIDFromContext(c)
+	cur, ok, err := cmGet(s.db, nsID, "current")
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -223,6 +275,7 @@ func (s *Server) currentController(c *gin.Context) {
 }
 
 func (s *Server) setCurrentController(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	var body struct {
 		Name string `json:"name"`
 	}
@@ -232,20 +285,22 @@ func (s *Server) setCurrentController(c *gin.Context) {
 	}
 
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM controllers WHERE name=?", body.Name).Scan(&count)
+	_ = s.db.QueryRow(
+		"SELECT COUNT(*) FROM controllers WHERE namespace_id=? AND name=?", nsID, body.Name,
+	).Scan(&count)
 	if count == 0 {
 		writeNotFound(c, fmt.Sprintf("controller %q not found", body.Name))
 		return
 	}
 
 	// Mirror MemStore: only update previous if the controller is actually changing.
-	cur, _, _ := cmGet(s.db, "current")
+	cur, _, _ := cmGet(s.db, nsID, "current")
 	if cur != body.Name {
 		if cur != "" {
-			_ = cmSet(s.db, "previous", cur)
-			_ = cmSet(s.db, "previous_switched", "true")
+			_ = cmSet(s.db, nsID, "previous", cur)
+			_ = cmSet(s.db, nsID, "previous_switched", "true")
 		}
-		if err := cmSet(s.db, "current", body.Name); err != nil {
+		if err := cmSet(s.db, nsID, "current", body.Name); err != nil {
 			c.String(http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -254,7 +309,8 @@ func (s *Server) setCurrentController(c *gin.Context) {
 }
 
 func (s *Server) previousController(c *gin.Context) {
-	prev, ok, err := cmGet(s.db, "previous")
+	nsID := namespaceIDFromContext(c)
+	prev, ok, err := cmGet(s.db, nsID, "previous")
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -263,7 +319,7 @@ func (s *Server) previousController(c *gin.Context) {
 		writeNotFound(c, "no previous controller")
 		return
 	}
-	switched, _, _ := cmGet(s.db, "previous_switched")
+	switched, _, _ := cmGet(s.db, nsID, "previous_switched")
 	c.JSON(http.StatusOK, gin.H{
 		"name":     prev,
 		"switched": switched == "true",
@@ -271,6 +327,7 @@ func (s *Server) previousController(c *gin.Context) {
 }
 
 func (s *Server) controllerByAPIEndpoints(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	var endpoints []string
 	if err := c.ShouldBindJSON(&endpoints); err != nil {
 		c.String(http.StatusBadRequest, err.Error())
@@ -281,7 +338,9 @@ func (s *Server) controllerByAPIEndpoints(c *gin.Context) {
 		endpointSet[ep] = true
 	}
 
-	rows, err := s.db.Query("SELECT name, details_json FROM controllers")
+	rows, err := s.db.Query(
+		"SELECT name, details_json FROM controllers WHERE namespace_id=?", nsID,
+	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return

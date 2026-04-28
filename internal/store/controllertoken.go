@@ -23,11 +23,14 @@ type controllerTokenResponse struct {
 // log in to the named controller directly. The token is base64-encoded so it
 // can be placed directly in a Juju LoginRequest.Token field.
 func (s *Server) controllerToken(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	name := c.Param("name")
 
 	// Resolve controller UUID from the stored details blob.
 	var detailsJSON string
-	err := s.db.QueryRow("SELECT details_json FROM controllers WHERE name=?", name).Scan(&detailsJSON)
+	err := s.db.QueryRow(
+		"SELECT details_json FROM controllers WHERE namespace_id=? AND name=?", nsID, name,
+	).Scan(&detailsJSON)
 	if err == sql.ErrNoRows {
 		writeNotFound(c, fmt.Sprintf("controller %q not found", name))
 		return
@@ -53,6 +56,20 @@ func (s *Server) controllerToken(c *gin.Context) {
 		return
 	}
 
+	// Look up the actual access level granted to this user for this controller.
+	// Fall back to "login" if no explicit grant exists (allows basic auth).
+	var accessLevel string
+	err = s.db.QueryRow(
+		`SELECT access FROM controller_access WHERE namespace_id=? AND controller_name=? AND user_id=?`,
+		nsID, name, userID,
+	).Scan(&accessLevel)
+	if err == sql.ErrNoRows {
+		accessLevel = "login"
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up access level"})
+		return
+	}
+
 	controllerTag := "controller-" + ctl.ControllerUUID
 
 	now := time.Now()
@@ -67,7 +84,7 @@ func (s *Server) controllerToken(c *gin.Context) {
 		"jti": uuid.New().String(),
 		// Juju-specific access claims.
 		"access": map[string]string{
-			controllerTag: "superuser",
+			controllerTag: accessLevel,
 		},
 	}
 

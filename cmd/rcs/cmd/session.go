@@ -9,8 +9,9 @@ import (
 
 // Session holds the persisted CLI session state.
 type Session struct {
-	Addr  string `json:"addr"`
-	Token string `json:"token"`
+	Addr      string `json:"addr"`
+	Token     string `json:"token"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // sessionPath returns the path to the session file.

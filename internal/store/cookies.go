@@ -8,9 +8,12 @@ import (
 )
 
 func (s *Server) getCookies(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
 	var cookies string
-	err := s.db.QueryRow("SELECT cookies_json FROM cookie_jars WHERE controller_name=?", ctrl).Scan(&cookies)
+	err := s.db.QueryRow(
+		"SELECT cookies_json FROM cookie_jars WHERE namespace_id=? AND controller_name=?", nsID, ctrl,
+	).Scan(&cookies)
 	if err != nil {
 		c.JSON(http.StatusOK, json.RawMessage("[]"))
 		return
@@ -19,6 +22,7 @@ func (s *Server) getCookies(c *gin.Context) {
 }
 
 func (s *Server) saveCookies(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
 	var raw json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -26,8 +30,9 @@ func (s *Server) saveCookies(c *gin.Context) {
 		return
 	}
 	_, err := s.db.Exec(
-		"INSERT INTO cookie_jars(controller_name,cookies_json) VALUES(?,?) ON CONFLICT(controller_name) DO UPDATE SET cookies_json=excluded.cookies_json",
-		ctrl, string(raw),
+		`INSERT INTO cookie_jars(namespace_id,controller_name,cookies_json) VALUES(?,?,?)
+		 ON CONFLICT(namespace_id,controller_name) DO UPDATE SET cookies_json=excluded.cookies_json`,
+		nsID, ctrl, string(raw),
 	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
@@ -37,8 +42,9 @@ func (s *Server) saveCookies(c *gin.Context) {
 }
 
 func (s *Server) removeAllCookies(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	ctrl := c.Param("name")
-	if _, err := s.db.Exec("DELETE FROM cookie_jars WHERE controller_name=?", ctrl); err != nil {
+	if _, err := s.db.Exec("DELETE FROM cookie_jars WHERE namespace_id=? AND controller_name=?", nsID, ctrl); err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -14,6 +14,7 @@ import (
 )
 
 const userIDKey = "userID"
+const namespaceIDKey = "namespaceID"
 
 // AuthMiddleware validates RCS session JWTs. It resolves the signing key by
 // the kid header, falling back to any key active within the token expiry window
@@ -49,6 +50,48 @@ func AuthMiddleware(db *sql.DB, tokenExpiry time.Duration) gin.HandlerFunc {
 	}
 }
 
+// NamespaceMiddleware reads the X-RCS-Namespace header (human-readable name),
+// validates that the authenticated user is a member, and sets namespaceID in
+// the context. Returns 400 if the header is missing, 404 if the namespace
+// does not exist, and 403 if the user is not a member.
+func NamespaceMiddleware(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		nsName := c.GetHeader("X-RCS-Namespace")
+		if nsName == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "X-RCS-Namespace header is required"})
+			return
+		}
+
+		userID := userIDFromContext(c)
+
+		var nsID string
+		err := db.QueryRow(
+			`SELECT n.id FROM namespaces n
+			 JOIN namespace_members m ON m.namespace_id = n.id
+			 WHERE n.name = ? AND m.user_id = ?`,
+			nsName, userID,
+		).Scan(&nsID)
+		if err == sql.ErrNoRows {
+			// Distinguish: namespace exists but user not a member vs namespace absent.
+			var exists int
+			_ = db.QueryRow(`SELECT COUNT(*) FROM namespaces WHERE name=?`, nsName).Scan(&exists)
+			if exists == 0 {
+				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "namespace not found"})
+			} else {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "not a member of namespace"})
+			}
+			return
+		}
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "namespace lookup failed"})
+			return
+		}
+
+		c.Set(namespaceIDKey, nsID)
+		c.Next()
+	}
+}
+
 // resolveKey finds the RSA public key for a JWT, using the kid header when
 // present, or searching all recently active keys as a fallback.
 func resolveKey(db *sql.DB, t *jwt.Token, window time.Duration) (*rsa.PublicKey, error) {
@@ -79,4 +122,9 @@ func resolveKey(db *sql.DB, t *jwt.Token, window time.Duration) (*rsa.PublicKey,
 // userIDFromContext returns the authenticated user's ID stored by AuthMiddleware.
 func userIDFromContext(c *gin.Context) string {
 	return c.GetString(userIDKey)
+}
+
+// namespaceIDFromContext returns the resolved namespace UUID stored by NamespaceMiddleware.
+func namespaceIDFromContext(c *gin.Context) string {
+	return c.GetString(namespaceIDKey)
 }

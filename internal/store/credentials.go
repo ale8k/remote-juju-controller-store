@@ -9,7 +9,8 @@ import (
 )
 
 func (s *Server) allCredentials(c *gin.Context) {
-	rows, err := s.db.Query("SELECT cloud_name, details_json FROM credentials")
+	nsID := namespaceIDFromContext(c)
+	rows, err := s.db.Query("SELECT cloud_name, details_json FROM credentials WHERE namespace_id=?", nsID)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		return
@@ -29,9 +30,12 @@ func (s *Server) allCredentials(c *gin.Context) {
 }
 
 func (s *Server) credentialForCloud(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	cloud := c.Param("cloud")
 	var details string
-	err := s.db.QueryRow("SELECT details_json FROM credentials WHERE cloud_name=?", cloud).Scan(&details)
+	err := s.db.QueryRow(
+		"SELECT details_json FROM credentials WHERE namespace_id=? AND cloud_name=?", nsID, cloud,
+	).Scan(&details)
 	if err != nil {
 		writeNotFound(c, fmt.Sprintf("no credentials for cloud %q", cloud))
 		return
@@ -40,6 +44,7 @@ func (s *Server) credentialForCloud(c *gin.Context) {
 }
 
 func (s *Server) updateCredential(c *gin.Context) {
+	nsID := namespaceIDFromContext(c)
 	cloud := c.Param("cloud")
 	var raw json.RawMessage
 	if err := c.ShouldBindJSON(&raw); err != nil {
@@ -47,8 +52,9 @@ func (s *Server) updateCredential(c *gin.Context) {
 		return
 	}
 	_, err := s.db.Exec(
-		"INSERT INTO credentials(cloud_name,details_json) VALUES(?,?) ON CONFLICT(cloud_name) DO UPDATE SET details_json=excluded.details_json",
-		cloud, string(raw),
+		`INSERT INTO credentials(namespace_id,cloud_name,details_json) VALUES(?,?,?)
+		 ON CONFLICT(namespace_id,cloud_name) DO UPDATE SET details_json=excluded.details_json`,
+		nsID, cloud, string(raw),
 	)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())

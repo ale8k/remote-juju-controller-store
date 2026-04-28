@@ -45,39 +45,6 @@ services:
       timeout: 10s
       retries: 30
 
-  rcs-openfga-migrate:
-    image: openfga/openfga:latest
-    container_name: rcs-openfga-migrate
-    command: migrate
-    user: "0:0"
-    environment:
-      - OPENFGA_DATASTORE_ENGINE=sqlite
-      - OPENFGA_DATASTORE_URI=file:/home/nonroot/tmp/openfga.db
-    volumes:
-      - ./tmp:/home/nonroot/tmp
-
-  rcs-openfga:
-    depends_on:
-      rcs-openfga-migrate:
-        condition: service_completed_successfully
-    image: openfga/openfga:latest
-    container_name: rcs-openfga
-    user: "0:0"
-    environment:
-      - OPENFGA_DATASTORE_ENGINE=sqlite
-      - OPENFGA_DATASTORE_URI=file:/home/nonroot/tmp/openfga.db
-      - OPENFGA_LOG_FORMAT=json
-    command: run
-    volumes:
-      - ./tmp:/home/nonroot/tmp
-    ports:
-      # Needed for the http server
-      - "8080:8080"
-      # Needed for the grpc server (if used)
-      - "8081:8081"
-      # Needed for the playground (Do not enable in prod!)
-      - "3000:3000"
-
 volumes:
   go-modules:
   go-cache:
