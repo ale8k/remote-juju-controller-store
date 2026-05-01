@@ -25,7 +25,7 @@ serve: build-srv
 
 generate:
 	mkdir -p pkg/client
-	go generate ./api/...
+	go generate ./api/... ./internal/db/...
 	@echo "generated pkg/client/client.gen.go"
 
 

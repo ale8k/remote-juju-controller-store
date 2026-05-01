@@ -1,99 +1,63 @@
 package cmd
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
 
-// nsCmd is the parent for all namespace sub-commands.
-var nsCmd = &cobra.Command{
-	Use:   "ns",
-	Short: "Manage namespaces",
-}
+var nsCmd = &cobra.Command{Use: "ns", Short: "Namespace operations"}
 
 var nsCreateCmd = &cobra.Command{
 	Use:   "create <name>",
-	Short: "Create a new namespace",
+	Short: "Create namespace",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		name := args[0]
-		sess, err := requireSession()
+		s, err := requireSession()
 		if err != nil {
 			return err
 		}
-
-		body, _ := json.Marshal(map[string]string{"name": name})
-		resp, err := authedRequest(cmd.Context(), sess, http.MethodPost, "/namespaces", body)
+		resp, err := authedRequest(s, http.MethodPost, "/namespaces", map[string]string{"name": args[0]})
 		if err != nil {
-			return fmt.Errorf("create namespace: %w", err)
+			return err
 		}
 		defer resp.Body.Close()
-
-		switch resp.StatusCode {
-		case http.StatusCreated:
-			var result struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&result); err == nil {
-				fmt.Fprintf(cmd.OutOrStdout(), "Namespace %q created (id: %s)\n", result.Name, result.ID)
-			} else {
-				fmt.Fprintf(cmd.OutOrStdout(), "Namespace %q created.\n", name)
-			}
-		case http.StatusConflict:
-			return fmt.Errorf("namespace %q already exists", name)
-		default:
-			return fmt.Errorf("create namespace: server returned %d", resp.StatusCode)
+		if err := mustStatus(resp, http.StatusCreated); err != nil {
+			return err
 		}
+		fmt.Fprintf(cmd.OutOrStdout(), "namespace %s created\n", args[0])
 		return nil
 	},
 }
 
 var nsListCmd = &cobra.Command{
 	Use:   "list",
-	Short: "List namespaces you are a member of",
-	Args:  cobra.NoArgs,
+	Short: "List accessible namespaces",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		sess, err := requireSession()
+		s, err := requireSession()
 		if err != nil {
 			return err
 		}
-
-		resp, err := authedRequest(cmd.Context(), sess, http.MethodGet, "/namespaces", nil)
+		resp, err := authedRequest(s, http.MethodGet, "/namespaces", nil)
 		if err != nil {
-			return fmt.Errorf("list namespaces: %w", err)
+			return err
 		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("list namespaces: server returned %d", resp.StatusCode)
+		if err := mustStatus(resp, http.StatusOK); err != nil {
+			return err
 		}
-
-		var nsList []struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			OwnerID string `json:"owner_id"`
+		b, _ := io.ReadAll(resp.Body)
+		var arr []map[string]any
+		if err := json.Unmarshal(b, &arr); err != nil {
+			return err
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&nsList); err != nil {
-			return fmt.Errorf("decode response: %w", err)
-		}
-
-		if len(nsList) == 0 {
-			fmt.Fprintln(cmd.OutOrStdout(), "No namespaces found.")
-			return nil
-		}
-
-		for _, ns := range nsList {
-			marker := ""
-			if ns.Name == sess.Namespace {
-				marker = " *"
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "  %s%s\n", ns.Name, marker)
+		for _, n := range arr {
+			name, _ := n["name"].(string)
+			fmt.Fprintln(cmd.OutOrStdout(), name)
 		}
 		return nil
 	},
@@ -101,133 +65,69 @@ var nsListCmd = &cobra.Command{
 
 var nsDeleteCmd = &cobra.Command{
 	Use:   "delete <name>",
-	Short: "Delete a namespace (owner only, destructive)",
+	Short: "Delete namespace",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		name := args[0]
-		sess, err := requireSession()
+		s, err := requireSession()
 		if err != nil {
 			return err
 		}
-
-		resp, err := authedRequest(cmd.Context(), sess, http.MethodDelete, "/namespaces/"+name, nil)
+		resp, err := authedRequest(s, http.MethodDelete, "/namespaces/"+args[0], nil)
 		if err != nil {
-			return fmt.Errorf("delete namespace: %w", err)
+			return err
 		}
 		defer resp.Body.Close()
-
-		switch resp.StatusCode {
-		case http.StatusNoContent:
-			// success
-		case http.StatusNotFound:
-			return fmt.Errorf("namespace %q not found", name)
-		case http.StatusForbidden:
-			return fmt.Errorf("only the namespace owner can delete it")
-		default:
-			return fmt.Errorf("delete namespace: server returned %d", resp.StatusCode)
+		if err := mustStatus(resp, http.StatusNoContent); err != nil {
+			return err
 		}
-
-		// If the deleted namespace was the active one, clear it from session.
-		if sess.Namespace == name {
-			sess.Namespace = ""
-			if err := saveSession(sess); err != nil {
-				return fmt.Errorf("clear namespace from session: %w", err)
-			}
+		fmt.Fprintf(cmd.OutOrStdout(), "namespace %s deleted\n", args[0])
+		if s.Namespace == args[0] {
+			s.Namespace = ""
+			_ = saveSession(*s)
 		}
-
-		fmt.Fprintf(cmd.OutOrStdout(), "Namespace %q deleted.\n", name)
 		return nil
 	},
 }
 
-// useCmd switches the active namespace in the session file.
 var useCmd = &cobra.Command{
-	Use:   "use <namespace>",
-	Short: "Switch the active namespace",
+	Use:   "use <name>",
+	Short: "Set active namespace in session",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		name := args[0]
-		sess, err := requireSession()
+		s, err := requireSession()
 		if err != nil {
 			return err
 		}
-
-		sess.Namespace = name
-		if err := saveSession(sess); err != nil {
-			return fmt.Errorf("save session: %w", err)
+		name := strings.TrimSpace(args[0])
+		s.Namespace = name
+		if err := saveSession(*s); err != nil {
+			return err
 		}
-
-		fmt.Fprintf(cmd.OutOrStdout(), "Active namespace set to %q.\n", name)
+		fmt.Fprintf(cmd.OutOrStdout(), "active namespace: %s\n", name)
 		return nil
 	},
 }
 
-// contextCmd shows the current session context.
 var contextCmd = &cobra.Command{
 	Use:   "context",
-	Short: "Show the current session context (server + namespace)",
-	Args:  cobra.NoArgs,
+	Short: "Show current server and namespace",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		sess, err := loadSession()
+		s, err := requireSession()
 		if err != nil {
-			return fmt.Errorf("load session: %w", err)
+			return err
 		}
-		if sess == nil {
-			fmt.Fprintln(cmd.OutOrStdout(), "Not logged in.")
-			return nil
-		}
-		fmt.Fprintf(cmd.OutOrStdout(), "Server:    %s\n", sess.Addr)
-		if sess.Namespace != "" {
-			fmt.Fprintf(cmd.OutOrStdout(), "Namespace: %s\n", sess.Namespace)
+		fmt.Fprintf(cmd.OutOrStdout(), "server: %s\n", s.Addr)
+		if s.Namespace == "" {
+			fmt.Fprintln(cmd.OutOrStdout(), "namespace: <unset>")
 		} else {
-			fmt.Fprintln(cmd.OutOrStdout(), "Namespace: (none)")
+			fmt.Fprintf(cmd.OutOrStdout(), "namespace: %s\n", s.Namespace)
 		}
 		return nil
 	},
-}
-
-// requireSession loads the session or returns an actionable error.
-func requireSession() (*Session, error) {
-	sess, err := loadSession()
-	if err != nil {
-		return nil, fmt.Errorf("load session: %w", err)
-	}
-	if sess == nil {
-		return nil, fmt.Errorf("not logged in — run: rcs login <addr>")
-	}
-	return sess, nil
-}
-
-// authedRequest makes an authenticated HTTP request to the RCS server using
-// the session token. Namespace management endpoints don't require a namespace
-// header, so none is sent here.
-func authedRequest(ctx context.Context, sess *Session, method, path string, body []byte) (*http.Response, error) {
-	addr := sess.Addr
-	if len(addr) > 0 && addr[len(addr)-1] == '/' {
-		addr = addr[:len(addr)-1]
-	}
-	var req *http.Request
-	var err error
-	if body != nil {
-		req, err = http.NewRequestWithContext(ctx, method, addr+path, bytes.NewReader(body))
-	} else {
-		req, err = http.NewRequestWithContext(ctx, method, addr+path, nil)
-	}
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+sess.Token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	return http.DefaultClient.Do(req)
 }
 
 func init() {
 	nsCmd.AddCommand(nsCreateCmd)
 	nsCmd.AddCommand(nsListCmd)
 	nsCmd.AddCommand(nsDeleteCmd)
-	rootCmd.AddCommand(nsCmd)
-	rootCmd.AddCommand(useCmd)
-	rootCmd.AddCommand(contextCmd)
 }

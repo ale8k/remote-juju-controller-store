@@ -8,18 +8,12 @@ import (
 
 var logoutCmd = &cobra.Command{
 	Use:   "logout",
-	Short: "Log out of the remote controller store",
-	Long:  `Removes the locally stored RCS session token.`,
-	Args:  cobra.NoArgs,
+	Short: "Clear local RCS session",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := clearSession(); err != nil {
-			return fmt.Errorf("clear session: %w", err)
+			return err
 		}
-		fmt.Fprintln(cmd.OutOrStdout(), "Logged out.")
+		fmt.Fprintln(cmd.OutOrStdout(), "logged out")
 		return nil
 	},
-}
-
-func init() {
-	rootCmd.AddCommand(logoutCmd)
 }
