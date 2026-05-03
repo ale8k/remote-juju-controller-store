@@ -1,12 +1,13 @@
 package cmd
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+
+	rcsclient "github.com/ale8k/remote-juju-controller-store/pkg/client"
 )
 
 func normalizeAddr(addr string) string {
@@ -15,32 +16,21 @@ func normalizeAddr(addr string) string {
 	return addr
 }
 
-func authedRequest(s *Session, method, path string, body any) (*http.Response, error) {
-	url := normalizeAddr(s.Addr) + path
-	var r io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		r = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, url, r)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+s.Token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if strings.TrimSpace(s.Namespace) != "" {
-		req.Header.Set("X-RCS-Namespace", s.Namespace)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
+func authedAPIClient(s *Session) (rcsclient.ClientWithResponsesInterface, error) {
+	return rcsclient.NewClientWithResponses(
+		normalizeAddr(s.Addr),
+		rcsclient.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+s.Token)
+			if strings.TrimSpace(s.Namespace) != "" {
+				req.Header.Set("X-RCS-Namespace", s.Namespace)
+			}
+			return nil
+		}),
+	)
+}
+
+func apiClient(addr string) (rcsclient.ClientWithResponsesInterface, error) {
+	return rcsclient.NewClientWithResponses(normalizeAddr(addr))
 }
 
 func mustStatus(resp *http.Response, expected ...int) error {

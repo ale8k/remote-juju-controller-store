@@ -75,6 +75,16 @@ func (q *Queries) DeleteNamespaceMembersByNamespaceID(ctx context.Context, names
 	return err
 }
 
+const deleteNamespaceMembersByUserID = `-- name: DeleteNamespaceMembersByUserID :exec
+DELETE FROM namespace_members
+WHERE user_id = ?
+`
+
+func (q *Queries) DeleteNamespaceMembersByUserID(ctx context.Context, userID string) error {
+	_, err := q.db.ExecContext(ctx, deleteNamespaceMembersByUserID, userID)
+	return err
+}
+
 const getNamespaceByName = `-- name: GetNamespaceByName :one
 SELECT id, name, owner_id, created_at
 FROM namespaces
@@ -177,6 +187,40 @@ func (q *Queries) ListNamespacesForUser(ctx context.Context, userID string) ([]N
 		return nil, err
 	}
 	return items, nil
+}
+
+const migrateNamespaceMembersUserID = `-- name: MigrateNamespaceMembersUserID :exec
+INSERT INTO namespace_members(namespace_id, user_id)
+SELECT nm.namespace_id, ?
+FROM namespace_members AS nm
+WHERE nm.user_id = ?
+ON CONFLICT(namespace_id, user_id) DO NOTHING
+`
+
+type MigrateNamespaceMembersUserIDParams struct {
+	UserID   string `json:"user_id"`
+	UserID_2 string `json:"user_id_2"`
+}
+
+func (q *Queries) MigrateNamespaceMembersUserID(ctx context.Context, arg MigrateNamespaceMembersUserIDParams) error {
+	_, err := q.db.ExecContext(ctx, migrateNamespaceMembersUserID, arg.UserID, arg.UserID_2)
+	return err
+}
+
+const reassignNamespaceOwnership = `-- name: ReassignNamespaceOwnership :exec
+UPDATE namespaces
+SET owner_id = ?
+WHERE owner_id = ?
+`
+
+type ReassignNamespaceOwnershipParams struct {
+	OwnerID   string `json:"owner_id"`
+	OwnerID_2 string `json:"owner_id_2"`
+}
+
+func (q *Queries) ReassignNamespaceOwnership(ctx context.Context, arg ReassignNamespaceOwnershipParams) error {
+	_, err := q.db.ExecContext(ctx, reassignNamespaceOwnership, arg.OwnerID, arg.OwnerID_2)
+	return err
 }
 
 const removeNamespaceMember = `-- name: RemoveNamespaceMember :exec

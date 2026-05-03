@@ -27,6 +27,8 @@ const getUserIDByEmail = `-- name: GetUserIDByEmail :one
 SELECT id
 FROM users
 WHERE email = ?
+ORDER BY created_at ASC
+LIMIT 1
 `
 
 func (q *Queries) GetUserIDByEmail(ctx context.Context, email sql.NullString) (string, error) {

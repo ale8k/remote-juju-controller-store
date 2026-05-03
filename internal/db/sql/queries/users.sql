@@ -11,4 +11,6 @@ WHERE id = ?;
 -- name: GetUserIDByEmail :one
 SELECT id
 FROM users
-WHERE email = ?;
+WHERE email = ?
+ORDER BY created_at ASC
+LIMIT 1;

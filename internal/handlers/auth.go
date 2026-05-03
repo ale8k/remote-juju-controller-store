@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -58,17 +59,36 @@ func (s *Server) authDevice(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "token was not issued for this client"})
 	}
 
+	canonicalUserID := idToken.Subject
+	if claims.Email != "" {
+		existingUserID, lookupErr := s.repo.Queries.GetUserIDByEmail(c.UserContext(), toNullableString(claims.Email))
+		switch {
+		case lookupErr == nil && existingUserID != "":
+			canonicalUserID = existingUserID
+		case isNotFound(lookupErr):
+			// First login for this email; use the provider subject as canonical id.
+		case lookupErr != nil:
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to resolve user identity"})
+		}
+	}
+
 	err = s.repo.Queries.UpsertUser(c.UserContext(), sqlc.UpsertUserParams{
-		ID:    idToken.Subject,
+		ID:    canonicalUserID,
 		Email: sql.NullString{String: claims.Email, Valid: claims.Email != ""},
 	})
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store user"})
 	}
 
+	if canonicalUserID != idToken.Subject {
+		if err := s.reconcileUserReferences(c, idToken.Subject, canonicalUserID); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to reconcile user membership"})
+		}
+	}
+
 	now := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
-		"sub":   idToken.Subject,
+		"sub":   canonicalUserID,
 		"email": claims.Email,
 		"iat":   jwt.NewNumericDate(now),
 		"exp":   jwt.NewNumericDate(now.Add(s.cfg.TokenExpiry)),
@@ -81,4 +101,40 @@ func (s *Server) authDevice(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(authDeviceResponse{Token: signed})
+}
+
+func (s *Server) reconcileUserReferences(c *fiber.Ctx, fromUserID, toUserID string) error {
+	if fromUserID == "" || toUserID == "" || fromUserID == toUserID {
+		return nil
+	}
+
+	tx, err := s.repo.DB.BeginTx(c.UserContext(), nil)
+	if err != nil {
+		return err
+	}
+	q := s.repo.Queries.WithTx(tx)
+	ops := []func() error{
+		func() error {
+			return q.MigrateNamespaceMembersUserID(c.UserContext(), sqlc.MigrateNamespaceMembersUserIDParams{UserID: toUserID, UserID_2: fromUserID})
+		},
+		func() error { return q.DeleteNamespaceMembersByUserID(c.UserContext(), fromUserID) },
+		func() error {
+			return q.ReassignNamespaceOwnership(c.UserContext(), sqlc.ReassignNamespaceOwnershipParams{OwnerID: toUserID, OwnerID_2: fromUserID})
+		},
+		func() error {
+			return q.MigrateControllerAccessUserID(c.UserContext(), sqlc.MigrateControllerAccessUserIDParams{UserID: toUserID, UserID_2: fromUserID})
+		},
+		func() error { return q.DeleteControllerAccessByUserID(c.UserContext(), fromUserID) },
+	}
+	for _, op := range ops {
+		if err := op(); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("reconciling user %q -> %q: %w", fromUserID, toUserID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
 }
