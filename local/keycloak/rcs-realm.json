@@ -11,6 +11,7 @@
   "defaultSignatureAlgorithm": "RS256",
   "users": [
     {
+      "id": "00000000-0000-0000-0000-000000000001",
       "username": "alice",
       "email": "alice@example.com",
       "emailVerified": true,
@@ -25,6 +26,7 @@
       "realmRoles": ["user"]
     },
     {
+      "id": "00000000-0000-0000-0000-000000000002",
       "username": "bob",
       "email": "bob@example.com",
       "emailVerified": true,

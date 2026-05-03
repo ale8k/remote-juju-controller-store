@@ -83,16 +83,6 @@ func (q *Queries) DeleteControllerAccessByNamespace(ctx context.Context, namespa
 	return err
 }
 
-const deleteControllerAccessByUserID = `-- name: DeleteControllerAccessByUserID :exec
-DELETE FROM controller_access
-WHERE user_id = ?
-`
-
-func (q *Queries) DeleteControllerAccessByUserID(ctx context.Context, userID string) error {
-	_, err := q.db.ExecContext(ctx, deleteControllerAccessByUserID, userID)
-	return err
-}
-
 const deleteControllerMetaByNamespace = `-- name: DeleteControllerMetaByNamespace :exec
 DELETE FROM controller_meta
 WHERE namespace_id = ?
@@ -235,24 +225,6 @@ func (q *Queries) ListControllersByNamespace(ctx context.Context, namespaceID st
 		return nil, err
 	}
 	return items, nil
-}
-
-const migrateControllerAccessUserID = `-- name: MigrateControllerAccessUserID :exec
-INSERT INTO controller_access(namespace_id, controller_name, user_id, access)
-SELECT ca.namespace_id, ca.controller_name, ?, ca.access
-FROM controller_access AS ca
-WHERE ca.user_id = ?
-ON CONFLICT(namespace_id, controller_name, user_id) DO NOTHING
-`
-
-type MigrateControllerAccessUserIDParams struct {
-	UserID   string `json:"user_id"`
-	UserID_2 string `json:"user_id_2"`
-}
-
-func (q *Queries) MigrateControllerAccessUserID(ctx context.Context, arg MigrateControllerAccessUserIDParams) error {
-	_, err := q.db.ExecContext(ctx, migrateControllerAccessUserID, arg.UserID, arg.UserID_2)
-	return err
 }
 
 const setControllerAccess = `-- name: SetControllerAccess :exec

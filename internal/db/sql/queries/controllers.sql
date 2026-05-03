@@ -67,14 +67,3 @@ WHERE namespace_id = ? AND controller_name = ?;
 -- name: DeleteControllerAccessByNamespace :exec
 DELETE FROM controller_access
 WHERE namespace_id = ?;
-
--- name: MigrateControllerAccessUserID :exec
-INSERT INTO controller_access(namespace_id, controller_name, user_id, access)
-SELECT ca.namespace_id, ca.controller_name, ?, ca.access
-FROM controller_access AS ca
-WHERE ca.user_id = ?
-ON CONFLICT(namespace_id, controller_name, user_id) DO NOTHING;
-
--- name: DeleteControllerAccessByUserID :exec
-DELETE FROM controller_access
-WHERE user_id = ?;

@@ -48,19 +48,3 @@ ORDER BY u.email ASC;
 -- name: DeleteNamespaceMembersByNamespaceID :exec
 DELETE FROM namespace_members
 WHERE namespace_id = ?;
-
--- name: MigrateNamespaceMembersUserID :exec
-INSERT INTO namespace_members(namespace_id, user_id)
-SELECT nm.namespace_id, ?
-FROM namespace_members AS nm
-WHERE nm.user_id = ?
-ON CONFLICT(namespace_id, user_id) DO NOTHING;
-
--- name: DeleteNamespaceMembersByUserID :exec
-DELETE FROM namespace_members
-WHERE user_id = ?;
-
--- name: ReassignNamespaceOwnership :exec
-UPDATE namespaces
-SET owner_id = ?
-WHERE owner_id = ?;

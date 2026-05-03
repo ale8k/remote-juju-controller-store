@@ -26,7 +26,6 @@ type Querier interface {
 	DeleteController(ctx context.Context, arg DeleteControllerParams) error
 	DeleteControllerAccessByController(ctx context.Context, arg DeleteControllerAccessByControllerParams) error
 	DeleteControllerAccessByNamespace(ctx context.Context, namespaceID string) error
-	DeleteControllerAccessByUserID(ctx context.Context, userID string) error
 	DeleteControllerMetaByNamespace(ctx context.Context, namespaceID string) error
 	DeleteControllerSelectionMeta(ctx context.Context, namespaceID string) error
 	DeleteControllersByNamespace(ctx context.Context, namespaceID string) error
@@ -40,7 +39,6 @@ type Querier interface {
 	DeleteModelsByNamespace(ctx context.Context, namespaceID string) error
 	DeleteNamespaceByID(ctx context.Context, id string) error
 	DeleteNamespaceMembersByNamespaceID(ctx context.Context, namespaceID string) error
-	DeleteNamespaceMembersByUserID(ctx context.Context, userID string) error
 	FindControllerByEndpoints(ctx context.Context, namespaceID string) ([]FindControllerByEndpointsRow, error)
 	GetAccountByController(ctx context.Context, arg GetAccountByControllerParams) (string, error)
 	GetBootstrapConfigByController(ctx context.Context, arg GetBootstrapConfigByControllerParams) (string, error)
@@ -66,9 +64,6 @@ type Querier interface {
 	ListNamespaceMemberEmails(ctx context.Context, namespaceID string) ([]sql.NullString, error)
 	ListNamespacesForUser(ctx context.Context, userID string) ([]Namespace, error)
 	ListSigningKeys(ctx context.Context) ([]SigningKey, error)
-	MigrateControllerAccessUserID(ctx context.Context, arg MigrateControllerAccessUserIDParams) error
-	MigrateNamespaceMembersUserID(ctx context.Context, arg MigrateNamespaceMembersUserIDParams) error
-	ReassignNamespaceOwnership(ctx context.Context, arg ReassignNamespaceOwnershipParams) error
 	RemoveNamespaceMember(ctx context.Context, arg RemoveNamespaceMemberParams) error
 	ReplaceModelsByController(ctx context.Context, arg ReplaceModelsByControllerParams) error
 	RetireControllerSigningKey(ctx context.Context, id string) error
